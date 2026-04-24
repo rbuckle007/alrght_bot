@@ -220,7 +220,7 @@ async def price_stream(symbol: str) -> None:
             logger.warning(f"WebSocket closed for {symbol}: {e}. Reconnecting in {reconnect_delay}s…")
         except Exception as e:
             logger.error(f"WebSocket error for {symbol}: {e}. Reconnecting in {reconnect_delay}s…")
-            await send_alert(f"⚠️ Bot WebSocket error ({symbol}): {e}")
+            
 
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, 60)   # exponential back-off, cap 60s
