@@ -1,5 +1,4 @@
-[phases.build]
-cmds = ["pip install -r requirements.txt"]
+
 
 [start]
 cmd = "python bott.py"
