@@ -535,8 +535,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("⏳ Fetching latest data...")
     lines = ["📊 *Current Status:*\n"]
     for symbol in coins:
-        s = coin_state.get(symbol, {})
-        for symbol in coins:
         s          = coin_state.get(symbol, {})
         price      = s.get("price")
         support    = s.get("support")
