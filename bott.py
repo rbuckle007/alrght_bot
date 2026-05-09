@@ -242,9 +242,12 @@ def create_payment_link(chat_id: int, username: str) -> dict | None:
         )
         resp.raise_for_status()
         return resp.json()
-    except Exception as e:
-        logger.error(f"Razorpay error: {e}")
-        return None
+    except requests.exceptions.HTTPError as e:
+    logger.error(f"Razorpay error: {e.response.text}")
+    return None
+except Exception as e:
+    logger.error(f"Razorpay error: {e}")
+    return None
 
 
 def verify_webhook_signature(body: bytes, signature: str) -> bool:
