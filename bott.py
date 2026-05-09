@@ -226,16 +226,16 @@ def create_payment_link(chat_id: int, username: str) -> dict | None:
         resp = requests.post(
             "https://api.razorpay.com/v1/payment_links",
             json={
-                "amount":           TIER_SETTINGS["pro"]["price"],
-                "currency":         "INR",
-                "accept_partial":   False,
-                "description":      "PivotAlert Pro - Monthly Subscription",
-                "customer":         {"name": username or "PivotAlert User"},
-                "notify":           {"sms": False, "email": False},
-                "reminder_enable":  False,
-                "notes":            {"chat_id": str(chat_id), "plan": "pro"},
-                "callback_url":     f"{WEBHOOK_URL}/payment/success",
-                "callback_method":  "get",
+                "amount":          TIER_SETTINGS["pro"]["price"],
+                "currency":        "INR",
+                "accept_partial":  False,
+                "description":     "PivotAlert Pro - Monthly Subscription",
+                "customer":        {"name": username or "PivotAlert User"},
+                "notify":          {"sms": False, "email": False},
+                "reminder_enable": False,
+                "notes":           {"chat_id": str(chat_id), "plan": "pro"},
+                "callback_url":    f"{WEBHOOK_URL}/payment/success",
+                "callback_method": "get",
             },
             auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
             timeout=10,
@@ -243,11 +243,11 @@ def create_payment_link(chat_id: int, username: str) -> dict | None:
         resp.raise_for_status()
         return resp.json()
     except requests.exceptions.HTTPError as e:
-    logger.error(f"Razorpay error: {e.response.text}")
-    return None
-except Exception as e:
-    logger.error(f"Razorpay error: {e}")
-    return None
+        logger.error(f"Razorpay error: {e.response.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Razorpay error: {e}")
+        return None
 
 
 def verify_webhook_signature(body: bytes, signature: str) -> bool:
