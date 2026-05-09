@@ -536,13 +536,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines = ["📊 *Current Status:*\n"]
     for symbol in coins:
         s = coin_state.get(symbol, {})
+        for symbol in coins:
+        s          = coin_state.get(symbol, {})
+        price      = s.get("price")
+        support    = s.get("support")
+        resistance = s.get("resistance")
+        rsi        = s.get("rsi")
+        signal     = s.get("last_signal") or "None"
         lines += [
             f"*{symbol.upper()}*",
-            f"  Price:      {'$' + f\"{s.get('price'):,.4f}\" if s.get('price') else 'loading...'}",
-            f"  Support:    {'$' + f\"{s.get('support'):,.4f}\" if s.get('support') else 'n/a'}",
-            f"  Resistance: {'$' + f\"{s.get('resistance'):,.4f}\" if s.get('resistance') else 'n/a'}",
-            f"  RSI:        {f\"{s.get('rsi'):.1f}\" if s.get('rsi') else 'n/a'}",
-            f"  Signal:     {s.get('last_signal') or 'None'}\n",
+            f"  Price:      {'$' + f'{price:,.4f}' if price else 'loading...'}",
+            f"  Support:    {'$' + f'{support:,.4f}' if support else 'n/a'}",
+            f"  Resistance: {'$' + f'{resistance:,.4f}' if resistance else 'n/a'}",
+            f"  RSI:        {f'{rsi:.1f}' if rsi else 'n/a'}",
+            f"  Signal:     {signal}\n",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
