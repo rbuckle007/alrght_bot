@@ -233,7 +233,6 @@ def create_payment_link(chat_id: int, username: str) -> dict | None:
                 "customer":        {"name": username or "PivotAlert User"},
                 "notify":          {"sms": False, "email": False},
                 "reminder_enable": False,
-                "upi_link": True,
                 "notes":           {"chat_id": str(chat_id), "plan": "pro"},
                 "callback_url":    f"{WEBHOOK_URL}/payment/success",
                 "callback_method": "get",
