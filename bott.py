@@ -33,6 +33,7 @@ ADMIN_CHAT_ID       = os.getenv("ADMIN_CHAT_ID")
 DATABASE_URL        = os.getenv("DATABASE_URL")
 RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
 WEBHOOK_URL         = os.getenv("WEBHOOK_URL")
 PORT                = int(os.getenv("PORT", 8080))
 
