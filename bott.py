@@ -252,7 +252,9 @@ def create_payment_link(chat_id: int, username: str) -> dict | None:
 
 def verify_webhook_signature(body: bytes, signature: str) -> bool:
     expected = hmac.new(
-        RAZORPAY_KEY_SECRET.encode(), body, hashlib.sha256
+        RAZORPAY_WEBHOOK_SECRET.encode(),
+        body,
+        hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
 
