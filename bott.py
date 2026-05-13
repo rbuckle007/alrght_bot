@@ -354,44 +354,208 @@ def validate_symbol(symbol: str) -> bool:
         return False
 
 
-def fetch_klines(symbol: str) -> list[dict]:
+def fetch_klines(symbol: str, interval: str = "1h", limit: int = 100) -> list[dict]:
+    """Fetch OHLCV candles from Binance."""
     try:
         resp = requests.get(
             f"https://api.binance.com/api/v3/klines"
-            f"?symbol={symbol.upper()}&interval={KLINE_INTERVAL}&limit={KLINE_LIMIT}",
+            f"?symbol={symbol.upper()}&interval={interval}&limit={limit}",
             timeout=10,
         )
         resp.raise_for_status()
         return [
-            {"open": float(c[1]), "high": float(c[2]),
-             "low":  float(c[3]), "close": float(c[4])}
+            {
+                "open":   float(c[1]),
+                "high":   float(c[2]),
+                "low":    float(c[3]),
+                "close":  float(c[4]),
+                "volume": float(c[5]),
+            }
             for c in resp.json()
         ]
     except Exception as e:
         logger.error(f"klines fetch failed for {symbol}: {e}")
         return []
-
+ 
 # ─────────────────────────────────────────────
 # Indicators
 # ─────────────────────────────────────────────
-def calculate_rsi(closes: list[float], period: int = RSI_PERIOD) -> float | None:
+def calculate_wilder_rsi(closes: list[float], period: int = 14) -> float | None:
+    """
+    Proper Wilder Smoothed RSI — matches TradingView exactly.
+    Uses exponential smoothing (RMA) not simple average.
+    """
     if len(closes) < period + 1:
         return None
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        delta = closes[-period - 1 + i] - closes[-period - 2 + i]
-        (gains if delta > 0 else losses).append(abs(delta))
-    avg_gain = sum(gains) / period if gains else 0.0
-    avg_loss = sum(losses) / period if losses else 1e-10
-    return 100 - (100 / (1 + avg_gain / avg_loss))
-
-
-def calculate_pivot_levels(candles: list[dict]) -> tuple:
-    if not candles:
+ 
+    # First average gain/loss (simple average for seed)
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains  = [max(d, 0) for d in deltas]
+    losses = [abs(min(d, 0)) for d in deltas]
+ 
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+ 
+    # Wilder smoothing for remaining candles
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+ 
+    if avg_loss == 0:
+        return 100.0
+ 
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+ 
+ 
+def calculate_ema(closes: list[float], period: int) -> float | None:
+    """Exponential Moving Average."""
+    if len(closes) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema = sum(closes[:period]) / period   # seed with SMA
+    for price in closes[period:]:
+        ema = (price - ema) * multiplier + ema
+    return round(ema, 4)
+ 
+ 
+def calculate_atr(candles: list[dict], period: int = 14) -> float | None:
+    """
+    Average True Range — measures volatility.
+    High ATR = volatile (good for signals).
+    Low ATR  = choppy/ranging (avoid signals).
+    """
+    if len(candles) < period + 1:
+        return None
+ 
+    true_ranges = []
+    for i in range(1, len(candles)):
+        high      = candles[i]["high"]
+        low       = candles[i]["low"]
+        prev_close= candles[i - 1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+ 
+    if len(true_ranges) < period:
+        return None
+ 
+    # Wilder smoothing for ATR too
+    atr = sum(true_ranges[:period]) / period
+    for tr in true_ranges[period:]:
+        atr = (atr * (period - 1) + tr) / period
+ 
+    return round(atr, 4)
+ 
+ 
+def calculate_pivot_levels(candles: list[dict], lookback: int = 5) -> tuple:
+    """
+    Multi-candle pivot using average of last N completed candles.
+    Much more robust than single-candle pivot.
+    Returns (support, resistance)
+    """
+    if len(candles) < lookback + 1:
         return None, None
-    last       = candles[-2] if len(candles) >= 2 else candles[-1]
-    pivot      = (last["high"] + last["low"] + last["close"]) / 3
-    return round(2 * pivot - last["high"], 4), round(2 * pivot - last["low"], 4)
+ 
+    # Use last `lookback` completed candles (exclude current)
+    recent = candles[-(lookback + 1):-1]
+ 
+    highs  = [c["high"]  for c in recent]
+    lows   = [c["low"]   for c in recent]
+    closes = [c["close"] for c in recent]
+ 
+    pivot      = (max(highs) + min(lows) + closes[-1]) / 3
+    support    = round(2 * pivot - max(highs), 4)
+    resistance = round(2 * pivot - min(lows),  4)
+ 
+    return support, resistance
+ 
+ 
+def calculate_volume_ratio(candles: list[dict], period: int = 20) -> float | None:
+    """
+    Current volume vs average volume ratio.
+    > 1.5 = above average volume (confirms signal)
+    < 0.8 = low volume (weak signal)
+    """
+    if len(candles) < period + 1:
+        return None
+    volumes    = [c["volume"] for c in candles]
+    avg_volume = sum(volumes[-period - 1:-1]) / period
+    if avg_volume == 0:
+        return None
+    return round(volumes[-1] / avg_volume, 2)
+ 
+ 
+def calculate_signal_strength(
+    rsi: float | None,
+    volume_ratio: float | None,
+    atr: float | None,
+    price: float,
+    ema_fast: float | None,
+    ema_slow: float | None,
+    signal_type: str,
+) -> int:
+    """
+    Score signal quality 1-5 stars based on confluence of indicators.
+    More confirmations = stronger signal.
+    """
+    score = 0
+ 
+    # RSI confirmation
+    if signal_type == "BUY" and rsi is not None:
+        if rsi <= 25:   score += 2   # extremely oversold
+        elif rsi <= 35: score += 1
+    elif signal_type == "SELL" and rsi is not None:
+        if rsi >= 75:   score += 2   # extremely overbought
+        elif rsi >= 65: score += 1
+ 
+    # Volume confirmation
+    if volume_ratio is not None:
+        if volume_ratio >= 2.0:   score += 2
+        elif volume_ratio >= 1.5: score += 1
+ 
+    # EMA trend alignment
+    if ema_fast and ema_slow:
+        if signal_type == "BUY"  and ema_fast > ema_slow: score += 1  # uptrend
+        if signal_type == "SELL" and ema_fast < ema_slow: score += 1  # downtrend
+ 
+    return min(score, 5)   # cap at 5
+ 
+ 
+def calculate_sl_tp(
+    price: float,
+    atr: float | None,
+    signal_type: str,
+    atr_multiplier_sl: float = 1.5,
+    atr_multiplier_tp: float = 2.5,
+) -> tuple[float, float]:
+    """
+    ATR-based Stop Loss and Take Profit.
+    SL = 1.5x ATR from entry
+    TP = 2.5x ATR from entry (Risk:Reward ≈ 1:1.67)
+    Falls back to % if ATR unavailable.
+    """
+    if atr and atr > 0:
+        sl_dist = atr * atr_multiplier_sl
+        tp_dist = atr * atr_multiplier_tp
+    else:
+        # Fallback: 1.5% SL, 3% TP
+        sl_dist = price * 0.015
+        tp_dist = price * 0.030
+ 
+    if signal_type == "BUY":
+        stop_loss   = round(price - sl_dist, 4)
+        take_profit = round(price + tp_dist, 4)
+    else:
+        stop_loss   = round(price + sl_dist, 4)
+        take_profit = round(price - tp_dist, 4)
+ 
+    return stop_loss, take_profit
+ 
+ 
+def stars(n: int) -> str:
+    """Convert score to star emoji string."""
+    return "⭐" * n + "☆" * (5 - n)
+ 
 
 # ─────────────────────────────────────────────
 # Coin state helpers
@@ -717,51 +881,143 @@ async def evaluate_signal(symbol: str) -> None:
     state = coin_state.get(symbol)
     if not state or state["price"] is None:
         return
-
-    candles = fetch_klines(symbol)
-    if not candles:
+ 
+    price = state["price"]
+ 
+    # Fetch candles — need enough for all indicators
+    candles = fetch_klines(symbol, interval="1h", limit=100)
+    if len(candles) < 30:
         return
-
-    support, resistance = calculate_pivot_levels(candles)
-    closes              = [c["close"] for c in candles]
-    rsi                 = calculate_rsi(closes)
-
-    if support is None:
+ 
+    closes = [c["close"] for c in candles]
+ 
+    # ── Calculate all indicators ──
+    rsi          = calculate_wilder_rsi(closes)
+    ema_fast     = calculate_ema(closes, 20)    # 20-period EMA (short term)
+    ema_slow     = calculate_ema(closes, 50)    # 50-period EMA (long term)
+    atr          = calculate_atr(candles)
+    volume_ratio = calculate_volume_ratio(candles)
+    support, resistance = calculate_pivot_levels(candles, lookback=5)
+ 
+    if support is None or resistance is None:
         return
-
-    state.update({"support": support, "resistance": resistance, "rsi": rsi})
-    price   = state["price"]
-    rsi_str = f"{rsi:.1f}" if rsi else "n/a"
-    logger.info(f"{symbol.upper():10s} | price={price:.4f} | S={support:.4f} | R={resistance:.4f} | RSI={rsi_str}")
-
+ 
+    # Store in state for /status command
+    state["support"]    = support
+    state["resistance"] = resistance
+    state["rsi"]        = rsi
+ 
+    rsi_str    = f"{rsi:.1f}"   if rsi    else "n/a"
+    atr_str    = f"{atr:.4f}"   if atr    else "n/a"
+    vol_str    = f"{volume_ratio:.2f}x" if volume_ratio else "n/a"
+    ema_f_str  = f"{ema_fast:.4f}"  if ema_fast  else "n/a"
+    ema_s_str  = f"{ema_slow:.4f}"  if ema_slow  else "n/a"
+ 
+    logger.info(
+        f"{symbol.upper():10s} | price={price:.4f} | "
+        f"S={support:.4f} | R={resistance:.4f} | "
+        f"RSI={rsi_str} | EMA20={ema_f_str} | EMA50={ema_s_str} | "
+        f"ATR={atr_str} | VOL={vol_str}"
+    )
+ 
     now         = time.time()
+    last_signal = state["last_signal"]
     on_cooldown = (now - state["last_alert_time"]) < TIER_SETTINGS["free"]["cooldown"]
-
-    if price >= resistance * (1 - PIVOT_TOLERANCE) and \
-       (rsi is None or rsi >= TIER_SETTINGS["free"]["rsi_overbought"]) and \
-       state["last_signal"] != "SELL" and not on_cooldown:
-        msg = (f"🚨 *{symbol.upper()} SELL SIGNAL*\n"
-               f"Price:      ${price:,.4f}\nResistance: ${resistance:,.4f}\nRSI: {rsi_str}\n\n"
-               f"_Powered by PivotAlert_ 📊")
-        await broadcast_signal(msg, symbol)
-        await log_signal(symbol, "SELL", price, support, resistance, rsi)
-        state["last_signal"], state["last_alert_time"] = "SELL", now
+ 
+    # ── EMA trend filter ──
+    uptrend   = ema_fast and ema_slow and ema_fast > ema_slow
+    downtrend = ema_fast and ema_slow and ema_fast < ema_slow
+ 
+    # ── ATR volatility filter — skip signals in choppy markets ──
+    # If ATR is less than 0.1% of price, market is too quiet
+    min_atr = price * 0.001
+    if atr and atr < min_atr:
+        logger.info(f"{symbol.upper()} — ATR too low ({atr_str}), skipping signal")
         return
-
-    if price <= support * (1 + PIVOT_TOLERANCE) and \
-       (rsi is None or rsi <= TIER_SETTINGS["free"]["rsi_oversold"]) and \
-       state["last_signal"] != "BUY" and not on_cooldown:
-        msg = (f"📈 *{symbol.upper()} BUY SIGNAL*\n"
-               f"Price:   ${price:,.4f}\nSupport: ${support:,.4f}\nRSI: {rsi_str}\n\n"
-               f"_Powered by PivotAlert_ 📊")
-        await broadcast_signal(msg, symbol)
+ 
+    # ── BUY conditions ──
+    near_support   = price <= support * (1 + PIVOT_TOLERANCE)
+    rsi_oversold   = rsi is not None and rsi <= TIER_SETTINGS["free"]["rsi_oversold"]
+    trend_ok_buy   = uptrend or (ema_fast is None)   # allow if no EMA data yet
+ 
+    if near_support and rsi_oversold and trend_ok_buy and \
+       last_signal != "BUY" and not on_cooldown:
+ 
+        strength         = calculate_signal_strength(
+            rsi, volume_ratio, atr, price, ema_fast, ema_slow, "BUY"
+        )
+        stop_loss, take_profit = calculate_sl_tp(price, atr, "BUY")
+        sl_pct = abs((stop_loss   - price) / price * 100)
+        tp_pct = abs((take_profit - price) / price * 100)
+        rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
+ 
+        message = (
+            f"📈 *{symbol.upper()} BUY SIGNAL*\n"
+            f"{'─' * 28}\n"
+            f"💰 Price:     ${price:,.4f}\n"
+            f"🟢 Support:   ${support:,.4f}\n"
+            f"📊 RSI:       {rsi_str} _(Oversold)_\n"
+            f"📈 EMA Trend: {'Bullish ✅' if uptrend else 'Neutral ⚠️'}\n"
+            f"📦 Volume:    {vol_str}\n"
+            f"💨 ATR:       {atr_str}\n"
+            f"{'─' * 28}\n"
+            f"🎯 Take Profit: ${take_profit:,.4f} _(+{tp_pct:.1f}%)_\n"
+            f"🛑 Stop Loss:   ${stop_loss:,.4f} _(-{sl_pct:.1f}%)_\n"
+            f"⚖️ Risk/Reward: 1:{rr}\n"
+            f"{'─' * 28}\n"
+            f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
+            f"_Powered by PivotAlert_ 📊"
+        )
+ 
+        await broadcast_signal(message, symbol)
         await log_signal(symbol, "BUY", price, support, resistance, rsi)
-        state["last_signal"], state["last_alert_time"] = "BUY", now
+        state["last_signal"]     = "BUY"
+        state["last_alert_time"] = now
         return
-
+ 
+    # ── SELL conditions ──
+    near_resistance = price >= resistance * (1 - PIVOT_TOLERANCE)
+    rsi_overbought  = rsi is not None and rsi >= TIER_SETTINGS["free"]["rsi_overbought"]
+    trend_ok_sell   = downtrend or (ema_fast is None)
+ 
+    if near_resistance and rsi_overbought and trend_ok_sell and \
+       last_signal != "SELL" and not on_cooldown:
+ 
+        strength         = calculate_signal_strength(
+            rsi, volume_ratio, atr, price, ema_fast, ema_slow, "SELL"
+        )
+        stop_loss, take_profit = calculate_sl_tp(price, atr, "SELL")
+        sl_pct = abs((stop_loss   - price) / price * 100)
+        tp_pct = abs((take_profit - price) / price * 100)
+        rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
+ 
+        message = (
+            f"🚨 *{symbol.upper()} SELL SIGNAL*\n"
+            f"{'─' * 28}\n"
+            f"💰 Price:      ${price:,.4f}\n"
+            f"🔴 Resistance: ${resistance:,.4f}\n"
+            f"📊 RSI:        {rsi_str} _(Overbought)_\n"
+            f"📉 EMA Trend:  {'Bearish ✅' if downtrend else 'Neutral ⚠️'}\n"
+            f"📦 Volume:     {vol_str}\n"
+            f"💨 ATR:        {atr_str}\n"
+            f"{'─' * 28}\n"
+            f"🎯 Take Profit: ${take_profit:,.4f} _(-{tp_pct:.1f}%)_\n"
+            f"🛑 Stop Loss:   ${stop_loss:,.4f} _(+{sl_pct:.1f}%)_\n"
+            f"⚖️ Risk/Reward: 1:{rr}\n"
+            f"{'─' * 28}\n"
+            f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
+            f"_Powered by PivotAlert_ 📊"
+        )
+ 
+        await broadcast_signal(message, symbol)
+        await log_signal(symbol, "SELL", price, support, resistance, rsi)
+        state["last_signal"]     = "SELL"
+        state["last_alert_time"] = now
+        return
+ 
     if support < price < resistance:
         state["last_signal"] = None
-
+ 
 
 async def signal_loop(interval_seconds: int = 60) -> None:
     await asyncio.sleep(5)
