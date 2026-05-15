@@ -1,9 +1,20 @@
 """
-PivotAlert - Multi-user Crypto Signal Bot
-Phase 2: Razorpay Payment Integration
-- Payment links generated via /upgrade command
-- Webhook server to receive payment confirmations
-- Auto-upgrade users after successful payment
+PivotAlert — Production Grade Signal Bot
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Architecture:
+  - Dual timeframe: 1h trend + 15m entry
+  - Event-driven: fires on candle CLOSE not timer
+  - Wilder RSI (TradingView accurate)
+  - Multi-candle pivot (5-candle average)
+  - EMA 20/50 trend filter
+  - ATR volatility filter
+  - Volume confirmation
+  - ATR-based SL/TP
+  - Signal strength scoring (1-5 stars)
+  - Per-tier cooldown & RSI thresholds
+  - Razorpay payments
+  - PostgreSQL multi-user database
+  - aiohttp webhook server
 """
 
 import os
@@ -27,40 +38,41 @@ from dotenv import load_dotenv
 # ─────────────────────────────────────────────
 load_dotenv()
 
-TOKEN               = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID             = os.getenv("TELEGRAM_CHAT_ID")
-ADMIN_CHAT_ID       = os.getenv("ADMIN_CHAT_ID")
-DATABASE_URL        = os.getenv("DATABASE_URL")
-RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+TOKEN                   = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID                 = os.getenv("TELEGRAM_CHAT_ID")
+ADMIN_CHAT_ID           = os.getenv("ADMIN_CHAT_ID")
+DATABASE_URL            = os.getenv("DATABASE_URL")
+RAZORPAY_KEY_ID         = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET     = os.getenv("RAZORPAY_KEY_SECRET")
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
-WEBHOOK_URL         = os.getenv("WEBHOOK_URL")
-PORT                = int(os.getenv("PORT", 8080))
+WEBHOOK_URL             = os.getenv("WEBHOOK_URL")
+PORT                    = int(os.getenv("PORT", 8080))
 
 if not TOKEN or not CHAT_ID:
     raise ValueError("❌ TELEGRAM_TOKEN or TELEGRAM_CHAT_ID missing!")
 
 DEFAULT_SYMBOLS = ["btcusdt", "ethusdt", "solusdt"]
 
-RSI_PERIOD      = 14
-KLINE_INTERVAL  = "1h"
-KLINE_LIMIT     = 50
-PIVOT_TOLERANCE = 0.003
+# Pivot tolerance — how close to S/R level to trigger
+PIVOT_TOLERANCE = 0.003   # ±0.3%
 
+# Per-tier settings
 TIER_SETTINGS = {
     "free": {
         "rsi_oversold":   35,
         "rsi_overbought": 65,
-        "cooldown":       7200,
+        "cooldown":       7200,   # 2 hours
         "coins":          ["btcusdt", "ethusdt", "solusdt"],
         "price":          0,
+        "min_strength":   2,      # minimum signal strength to receive
     },
     "pro": {
         "rsi_oversold":   38,
         "rsi_overbought": 62,
-        "cooldown":       3600,
-        "coins":          None,
+        "cooldown":       1800,   # 30 minutes
+        "coins":          None,   # all coins
         "price":          29900,
+        "min_strength":   1,      # receive all signals
     },
 }
 
@@ -80,8 +92,13 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # Global state
 # ─────────────────────────────────────────────
+# coin_state stores per-symbol runtime data
 coin_state: dict[str, dict] = {}
-active_streams: dict[str, asyncio.Task] = {}
+
+# active_streams tracks running WebSocket tasks
+active_streams: dict[str, list[asyncio.Task]] = {}
+
+# database pool
 db_pool = None
 
 # ─────────────────────────────────────────────
@@ -109,6 +126,9 @@ async def init_db() -> None:
                 support     FLOAT,
                 resistance  FLOAT,
                 rsi         FLOAT,
+                strength    INTEGER,
+                stop_loss   FLOAT,
+                take_profit FLOAT,
                 fired_at    TIMESTAMP DEFAULT NOW()
             )
         """)
@@ -139,7 +159,9 @@ async def init_db() -> None:
 
 async def get_all_subscribers() -> list[dict]:
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT chat_id, plan FROM users WHERE subscribed = TRUE")
+        rows = await conn.fetch(
+            "SELECT chat_id, plan FROM users WHERE subscribed = TRUE"
+        )
     return [dict(r) for r in rows]
 
 
@@ -161,12 +183,18 @@ async def remove_tracked_coin(symbol: str) -> None:
         await conn.execute("DELETE FROM tracked_coins WHERE symbol = $1", symbol)
 
 
-async def log_signal(symbol, signal_type, price, support, resistance, rsi) -> None:
+async def log_signal(
+    symbol: str, signal_type: str, price: float,
+    support: float, resistance: float, rsi: float,
+    strength: int, stop_loss: float, take_profit: float,
+) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO signal_history (symbol, signal_type, price, support, resistance, rsi)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """, symbol, signal_type, price, support, resistance, rsi or 0)
+            INSERT INTO signal_history
+            (symbol, signal_type, price, support, resistance, rsi, strength, stop_loss, take_profit)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        """, symbol, signal_type, price, support, resistance,
+            rsi or 0, strength, stop_loss, take_profit)
 
 
 async def save_payment(chat_id: int, payment_link_id: str, amount: int) -> None:
@@ -180,12 +208,12 @@ async def save_payment(chat_id: int, payment_link_id: str, amount: int) -> None:
 async def mark_payment_paid(payment_link_id: str, payment_id: str) -> int | None:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("""
-            UPDATE payments SET status = 'paid', payment_id = $1, paid_at = NOW()
-            WHERE payment_link_id = $2 RETURNING chat_id
+            UPDATE payments SET status='paid', payment_id=$1, paid_at=NOW()
+            WHERE payment_link_id=$2 RETURNING chat_id
         """, payment_id, payment_link_id)
         if row:
             await conn.execute(
-                "UPDATE users SET plan = 'pro' WHERE chat_id = $1", row["chat_id"]
+                "UPDATE users SET plan='pro' WHERE chat_id=$1", row["chat_id"]
             )
             return row["chat_id"]
     return None
@@ -203,21 +231,40 @@ async def send_alert(message: str) -> None:
         logger.error(f"Failed to send alert: {e}")
 
 
-async def broadcast_signal(message: str, symbol: str) -> None:
+async def broadcast_signal(message: str, symbol: str, strength: int) -> None:
+    """
+    Broadcast signal to subscribers.
+    Free users: only their 3 coins + min strength 2
+    Pro users:  all coins + all strengths
+    """
     subscribers = await get_all_subscribers()
     sent = 0
     for user in subscribers:
-        tier    = user["plan"]
-        allowed = TIER_SETTINGS[tier]["coins"]
+        tier     = user["plan"]
+        settings = TIER_SETTINGS[tier]
+        allowed  = settings["coins"]
+        min_str  = settings["min_strength"]
+
+        # Tier coin filter
         if allowed and symbol not in allowed:
             continue
+
+        # Tier strength filter — free users skip weak signals
+        if strength < min_str:
+            continue
+
         try:
-            await bot.send_message(chat_id=user["chat_id"], text=message, parse_mode="Markdown")
+            await bot.send_message(
+                chat_id=user["chat_id"],
+                text=message,
+                parse_mode="Markdown"
+            )
             sent += 1
             await asyncio.sleep(0.05)
         except Exception as e:
             logger.warning(f"Could not send to {user['chat_id']}: {e}")
-    logger.info(f"Signal broadcasted to {sent}/{len(subscribers)} users")
+
+    logger.info(f"Signal sent to {sent}/{len(subscribers)} users")
 
 # ─────────────────────────────────────────────
 # Razorpay helpers
@@ -253,9 +300,7 @@ def create_payment_link(chat_id: int, username: str) -> dict | None:
 
 def verify_webhook_signature(body: bytes, signature: str) -> bool:
     expected = hmac.new(
-        RAZORPAY_WEBHOOK_SECRET.encode(),
-        body,
-        hashlib.sha256
+        RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
 
@@ -266,7 +311,6 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
     try:
         body      = await request.read()
         signature = request.headers.get("X-Razorpay-Signature", "")
-
         if not verify_webhook_signature(body, signature):
             logger.warning("Invalid webhook signature!")
             return web.Response(status=400, text="Invalid signature")
@@ -289,9 +333,10 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
                         "Welcome to *PivotAlert Pro!* ⭐\n\n"
                         "You now have access to:\n"
                         "• All tracked coins\n"
-                        "• 1 hour cooldown\n"
+                        "• 30 min cooldown\n"
+                        "• All signal strengths\n"
                         "• Priority signals\n\n"
-                        "Signals will start arriving shortly! 📈"
+                        "Signals incoming! 📈"
                     ),
                     parse_mode="Markdown"
                 )
@@ -305,7 +350,6 @@ async def handle_razorpay_webhook(request: web.Request) -> web.Response:
                     ),
                     parse_mode="Markdown"
                 )
-
         return web.Response(status=200, text="OK")
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -328,7 +372,12 @@ async def handle_payment_success(request: web.Request) -> web.Response:
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    return web.Response(text="PivotAlert is running! 🚀")
+    coins  = list(coin_state.keys())
+    prices = {s: coin_state[s].get("price") for s in coins}
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps({"status": "running", "coins": prices})
+    )
 
 
 async def start_webhook_server() -> None:
@@ -342,241 +391,441 @@ async def start_webhook_server() -> None:
     logger.info(f"✅ Webhook server running on port {PORT}")
 
 # ─────────────────────────────────────────────
-# Binance helpers
+# Binance REST — fetch candles
 # ─────────────────────────────────────────────
-def validate_symbol(symbol: str) -> bool:
-    try:
-        resp = requests.get(
-            f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}", timeout=5
-        )
-        return resp.status_code == 200
-    except Exception:
-        return False
+async def fetch_klines_async(
+    symbol: str, interval: str, limit: int = 100
+) -> list[dict]:
+    """Non-blocking kline fetch using asyncio executor."""
+    def _fetch():
+        try:
+            resp = requests.get(
+                f"https://api.binance.com/api/v3/klines"
+                f"?symbol={symbol.upper()}&interval={interval}&limit={limit}",
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return [
+                {
+                    "open":   float(c[1]),
+                    "high":   float(c[2]),
+                    "low":    float(c[3]),
+                    "close":  float(c[4]),
+                    "volume": float(c[5]),
+                }
+                for c in resp.json()
+            ]
+        except Exception as e:
+            logger.error(f"klines fetch failed [{symbol} {interval}]: {e}")
+            return []
 
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch)
 
-def fetch_klines(symbol: str, interval: str = "1h", limit: int = 100) -> list[dict]:
-    """Fetch OHLCV candles from Binance."""
-    try:
-        resp = requests.get(
-            f"https://api.binance.com/api/v3/klines"
-            f"?symbol={symbol.upper()}&interval={interval}&limit={limit}",
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return [
-            {
-                "open":   float(c[1]),
-                "high":   float(c[2]),
-                "low":    float(c[3]),
-                "close":  float(c[4]),
-                "volume": float(c[5]),
-            }
-            for c in resp.json()
-        ]
-    except Exception as e:
-        logger.error(f"klines fetch failed for {symbol}: {e}")
-        return []
- 
 # ─────────────────────────────────────────────
 # Indicators
 # ─────────────────────────────────────────────
-def calculate_wilder_rsi(closes: list[float], period: int = 14) -> float | None:
+def wilder_rsi(closes: list[float], period: int = 14) -> float | None:
     """
-    Proper Wilder Smoothed RSI — matches TradingView exactly.
-    Uses exponential smoothing (RMA) not simple average.
+    Wilder Smoothed RSI — matches TradingView exactly.
+    Uses RMA (Wilder moving average) not SMA.
     """
     if len(closes) < period + 1:
         return None
- 
-    # First average gain/loss (simple average for seed)
-    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains  = [max(d, 0) for d in deltas]
-    losses = [abs(min(d, 0)) for d in deltas]
- 
+
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+
+    # Seed with simple average
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
- 
-    # Wilder smoothing for remaining candles
+
+    # Wilder smoothing
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
- 
+
     if avg_loss == 0:
         return 100.0
- 
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
- 
- 
-def calculate_ema(closes: list[float], period: int) -> float | None:
+
+
+def ema(closes: list[float], period: int) -> float | None:
     """Exponential Moving Average."""
     if len(closes) < period:
         return None
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period   # seed with SMA
+    k   = 2 / (period + 1)
+    val = sum(closes[:period]) / period
     for price in closes[period:]:
-        ema = (price - ema) * multiplier + ema
-    return round(ema, 4)
- 
- 
-def calculate_atr(candles: list[dict], period: int = 14) -> float | None:
-    """
-    Average True Range — measures volatility.
-    High ATR = volatile (good for signals).
-    Low ATR  = choppy/ranging (avoid signals).
-    """
+        val = price * k + val * (1 - k)
+    return round(val, 6)
+
+
+def atr(candles: list[dict], period: int = 14) -> float | None:
+    """Wilder Average True Range."""
     if len(candles) < period + 1:
         return None
- 
-    true_ranges = []
+    trs = []
     for i in range(1, len(candles)):
-        high      = candles[i]["high"]
-        low       = candles[i]["low"]
-        prev_close= candles[i - 1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        true_ranges.append(tr)
- 
-    if len(true_ranges) < period:
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
         return None
- 
-    # Wilder smoothing for ATR too
-    atr = sum(true_ranges[:period]) / period
-    for tr in true_ranges[period:]:
-        atr = (atr * (period - 1) + tr) / period
- 
-    return round(atr, 4)
- 
- 
-def calculate_pivot_levels(candles: list[dict], lookback: int = 5) -> tuple:
+    val = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        val = (val * (period - 1) + tr) / period
+    return round(val, 6)
+
+
+def pivot_levels(candles: list[dict], lookback: int = 5) -> tuple:
     """
-    Multi-candle pivot using average of last N completed candles.
-    Much more robust than single-candle pivot.
-    Returns (support, resistance)
+    Multi-candle pivot — uses highest high, lowest low, last close
+    of the last `lookback` completed candles.
+    Much more stable than single-candle pivot.
     """
     if len(candles) < lookback + 1:
         return None, None
- 
-    # Use last `lookback` completed candles (exclude current)
+    # Exclude the current (incomplete) candle
     recent = candles[-(lookback + 1):-1]
- 
-    highs  = [c["high"]  for c in recent]
-    lows   = [c["low"]   for c in recent]
-    closes = [c["close"] for c in recent]
- 
-    pivot      = (max(highs) + min(lows) + closes[-1]) / 3
-    support    = round(2 * pivot - max(highs), 4)
-    resistance = round(2 * pivot - min(lows),  4)
- 
-    return support, resistance
- 
- 
-def calculate_volume_ratio(candles: list[dict], period: int = 20) -> float | None:
-    """
-    Current volume vs average volume ratio.
-    > 1.5 = above average volume (confirms signal)
-    < 0.8 = low volume (weak signal)
-    """
+    high   = max(c["high"]  for c in recent)
+    low    = min(c["low"]   for c in recent)
+    close  = recent[-1]["close"]
+    p      = (high + low + close) / 3
+    return round(2*p - high, 6), round(2*p - low, 6)
+
+
+def volume_ratio(candles: list[dict], period: int = 20) -> float | None:
+    """Current volume vs N-period average."""
     if len(candles) < period + 1:
         return None
-    volumes    = [c["volume"] for c in candles]
-    avg_volume = sum(volumes[-period - 1:-1]) / period
-    if avg_volume == 0:
-        return None
-    return round(volumes[-1] / avg_volume, 2)
- 
- 
-def calculate_signal_strength(
-    rsi: float | None,
-    volume_ratio: float | None,
-    atr: float | None,
-    price: float,
+    vols = [c["volume"] for c in candles]
+    avg  = sum(vols[-(period+1):-1]) / period
+    return round(vols[-1] / avg, 2) if avg > 0 else None
+
+
+def signal_strength(
+    rsi_val: float | None,
+    vol_ratio: float | None,
     ema_fast: float | None,
     ema_slow: float | None,
     signal_type: str,
+    tier: str = "free",
 ) -> int:
     """
-    Score signal quality 1-5 stars based on confluence of indicators.
-    More confirmations = stronger signal.
+    Score 0-5 based on confluence.
+    Uses tier-specific RSI thresholds.
     """
-    score = 0
- 
-    # RSI confirmation
-    if signal_type == "BUY" and rsi is not None:
-        if rsi <= 25:   score += 2   # extremely oversold
-        elif rsi <= 35: score += 1
-    elif signal_type == "SELL" and rsi is not None:
-        if rsi >= 75:   score += 2   # extremely overbought
-        elif rsi >= 65: score += 1
- 
+    score    = 0
+    settings = TIER_SETTINGS[tier]
+
+    # RSI strength
+    if rsi_val is not None:
+        if signal_type == "BUY":
+            if rsi_val <= settings["rsi_oversold"] - 10: score += 2
+            elif rsi_val <= settings["rsi_oversold"]:    score += 1
+        else:
+            if rsi_val >= settings["rsi_overbought"] + 10: score += 2
+            elif rsi_val >= settings["rsi_overbought"]:    score += 1
+
     # Volume confirmation
-    if volume_ratio is not None:
-        if volume_ratio >= 2.0:   score += 2
-        elif volume_ratio >= 1.5: score += 1
- 
+    if vol_ratio is not None:
+        if vol_ratio >= 2.0:   score += 2
+        elif vol_ratio >= 1.5: score += 1
+
     # EMA trend alignment
     if ema_fast and ema_slow:
-        if signal_type == "BUY"  and ema_fast > ema_slow: score += 1  # uptrend
-        if signal_type == "SELL" and ema_fast < ema_slow: score += 1  # downtrend
- 
-    return min(score, 5)   # cap at 5
- 
- 
-def calculate_sl_tp(
+        if signal_type == "BUY"  and ema_fast > ema_slow: score += 1
+        if signal_type == "SELL" and ema_fast < ema_slow: score += 1
+
+    return min(score, 5)
+
+
+def sl_tp(
     price: float,
-    atr: float | None,
+    atr_val: float | None,
     signal_type: str,
-    atr_multiplier_sl: float = 1.5,
-    atr_multiplier_tp: float = 2.5,
+    sl_mult: float = 1.5,
+    tp_mult: float = 2.5,
 ) -> tuple[float, float]:
-    """
-    ATR-based Stop Loss and Take Profit.
-    SL = 1.5x ATR from entry
-    TP = 2.5x ATR from entry (Risk:Reward ≈ 1:1.67)
-    Falls back to % if ATR unavailable.
-    """
-    if atr and atr > 0:
-        sl_dist = atr * atr_multiplier_sl
-        tp_dist = atr * atr_multiplier_tp
-    else:
-        # Fallback: 1.5% SL, 3% TP
-        sl_dist = price * 0.015
-        tp_dist = price * 0.030
- 
+    """ATR-based Stop Loss and Take Profit."""
+    dist_sl = (atr_val * sl_mult) if atr_val else (price * 0.015)
+    dist_tp = (atr_val * tp_mult) if atr_val else (price * 0.030)
     if signal_type == "BUY":
-        stop_loss   = round(price - sl_dist, 4)
-        take_profit = round(price + tp_dist, 4)
-    else:
-        stop_loss   = round(price + sl_dist, 4)
-        take_profit = round(price - tp_dist, 4)
- 
-    return stop_loss, take_profit
- 
- 
+        return round(price - dist_sl, 4), round(price + dist_tp, 4)
+    return round(price + dist_sl, 4), round(price - dist_tp, 4)
+
+
 def stars(n: int) -> str:
-    """Convert score to star emoji string."""
     return "⭐" * n + "☆" * (5 - n)
- 
 
 # ─────────────────────────────────────────────
 # Coin state helpers
 # ─────────────────────────────────────────────
-def add_coin_state(symbol: str) -> None:
+def init_coin_state(symbol: str) -> None:
     if symbol not in coin_state:
         coin_state[symbol] = {
-            "price": None, "last_signal": None,
-            "last_alert_time": 0, "support": None,
-            "resistance": None, "rsi": None,
+            "price":           None,   # live tick price
+            "last_signal":     None,   # "BUY" | "SELL" | None
+            "last_alert_time": 0,
+            "support":         None,
+            "resistance":      None,
+            "rsi":             None,
+            "ema_fast":        None,
+            "ema_slow":        None,
+            "atr":             None,
+            "volume_ratio":    None,
+            "trend":           None,   # "up" | "down" | "neutral"
         }
 
 
-def remove_coin_state(symbol: str) -> None:
+def cleanup_coin(symbol: str) -> None:
     coin_state.pop(symbol, None)
-    if symbol in active_streams:
-        active_streams[symbol].cancel()
-        del active_streams[symbol]
+    for task in active_streams.pop(symbol, []):
+        task.cancel()
 
 # ─────────────────────────────────────────────
-# User commands
+# Signal evaluation — called on every 15m candle close
+# ─────────────────────────────────────────────
+async def evaluate_signal(symbol: str) -> None:
+    """
+    Full signal evaluation triggered by 15m candle close.
+    Uses 1h candles for trend (EMA, pivot) and 15m for entry (RSI).
+    """
+    state = coin_state.get(symbol)
+    if not state:
+        return
+
+    price = state["price"]
+    if price is None:
+        return
+
+    # ── Fetch both timeframes concurrently ──
+    candles_1h, candles_15m = await asyncio.gather(
+        fetch_klines_async(symbol, "1h",  limit=100),
+        fetch_klines_async(symbol, "15m", limit=100),
+    )
+
+    if len(candles_1h) < 30 or len(candles_15m) < 30:
+        return
+
+    closes_1h  = [c["close"] for c in candles_1h]
+    closes_15m = [c["close"] for c in candles_15m]
+
+    # ── Trend indicators from 1h ──
+    ema_fast     = ema(closes_1h, 20)
+    ema_slow     = ema(closes_1h, 50)
+    atr_val      = atr(candles_1h)
+    support, resistance = pivot_levels(candles_1h, lookback=5)
+
+    # ── Entry indicators from 15m ──
+    rsi_val  = wilder_rsi(closes_15m)
+    vol_rat  = volume_ratio(candles_15m)
+
+    if support is None or resistance is None:
+        return
+
+    # ── Trend direction ──
+    uptrend   = ema_fast and ema_slow and ema_fast > ema_slow
+    downtrend = ema_fast and ema_slow and ema_fast < ema_slow
+    trend_str = "Bullish 📈" if uptrend else ("Bearish 📉" if downtrend else "Neutral ⚠️")
+
+    # ── Update state for /status command ──
+    state.update({
+        "support":      support,
+        "resistance":   resistance,
+        "rsi":          rsi_val,
+        "ema_fast":     ema_fast,
+        "ema_slow":     ema_slow,
+        "atr":          atr_val,
+        "volume_ratio": vol_rat,
+        "trend":        trend_str,
+    })
+
+    rsi_str = f"{rsi_val:.1f}" if rsi_val else "n/a"
+    vol_str = f"{vol_rat:.2f}x" if vol_rat else "n/a"
+    atr_str = f"{atr_val:.4f}" if atr_val else "n/a"
+
+    logger.info(
+        f"{symbol.upper():10s} | ${price:.2f} | "
+        f"S=${support:.2f} R=${resistance:.2f} | "
+        f"RSI(15m)={rsi_str} | EMA20={ema_fast:.2f} EMA50={ema_slow:.2f} | "
+        f"ATR={atr_str} | VOL={vol_str} | Trend={trend_str}"
+        if ema_fast and ema_slow else
+        f"{symbol.upper():10s} | ${price:.2f} | "
+        f"S=${support:.2f} R=${resistance:.2f} | RSI={rsi_str}"
+    )
+
+    # ── ATR volatility filter — skip dead markets ──
+    if atr_val and atr_val < price * 0.001:
+        logger.info(f"{symbol.upper()} — market too quiet (ATR={atr_str}), skipping")
+        return
+
+    # ── Per-coin cooldown uses WORST tier (free) so no signal is missed ──
+    # Individual subscribers are filtered by their own tier cooldown in broadcast
+    now         = time.time()
+    last_signal = state["last_signal"]
+    # Use pro cooldown as global gate (shorter = more signals available)
+    on_cooldown = (now - state["last_alert_time"]) < TIER_SETTINGS["pro"]["cooldown"]
+
+    # ── BUY signal ──
+    near_support = price <= support * (1 + PIVOT_TOLERANCE)
+    # Require confirmed uptrend OR neutral (not strong downtrend)
+    trend_ok_buy = not downtrend
+
+    # Use free tier RSI as base threshold
+    rsi_ok_buy = rsi_val is not None and rsi_val <= TIER_SETTINGS["free"]["rsi_oversold"]
+
+    if near_support and rsi_ok_buy and trend_ok_buy and \
+       last_signal != "BUY" and not on_cooldown:
+
+        strength = signal_strength(rsi_val, vol_rat, ema_fast, ema_slow, "BUY")
+        stop_loss, take_profit = sl_tp(price, atr_val, "BUY")
+        sl_pct = abs((stop_loss   - price) / price * 100)
+        tp_pct = abs((take_profit - price) / price * 100)
+        rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
+
+        message = (
+            f"📈 *{symbol.upper()} BUY SIGNAL*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Price:      ${price:,.4f}\n"
+            f"🟢 Support:    ${support:,.4f}\n"
+            f"📊 RSI (15m):  {rsi_str} _(Oversold)_\n"
+            f"📈 Trend (1h): {trend_str}\n"
+            f"📦 Volume:     {vol_str}\n"
+            f"💨 ATR:        {atr_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 Take Profit: ${take_profit:,.4f} _(+{tp_pct:.1f}%)_\n"
+            f"🛑 Stop Loss:   ${stop_loss:,.4f} _(-{sl_pct:.1f}%)_\n"
+            f"⚖️ Risk/Reward: 1:{rr}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
+            f"_PivotAlert — Dual TF Signal_ 📊"
+        )
+
+        await broadcast_signal(message, symbol, strength)
+        await log_signal(symbol, "BUY", price, support, resistance,
+                         rsi_val, strength, stop_loss, take_profit)
+        state["last_signal"]     = "BUY"
+        state["last_alert_time"] = now
+        logger.info(f"✅ BUY signal fired: {symbol.upper()} @ ${price:.2f} strength={strength}")
+        return
+
+    # ── SELL signal ──
+    near_resistance = price >= resistance * (1 - PIVOT_TOLERANCE)
+    trend_ok_sell   = not uptrend   # require confirmed downtrend OR neutral
+    rsi_ok_sell     = rsi_val is not None and rsi_val >= TIER_SETTINGS["free"]["rsi_overbought"]
+
+    if near_resistance and rsi_ok_sell and trend_ok_sell and \
+       last_signal != "SELL" and not on_cooldown:
+
+        strength = signal_strength(rsi_val, vol_rat, ema_fast, ema_slow, "SELL")
+        stop_loss, take_profit = sl_tp(price, atr_val, "SELL")
+        sl_pct = abs((stop_loss   - price) / price * 100)
+        tp_pct = abs((take_profit - price) / price * 100)
+        rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
+
+        message = (
+            f"🚨 *{symbol.upper()} SELL SIGNAL*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Price:      ${price:,.4f}\n"
+            f"🔴 Resistance: ${resistance:,.4f}\n"
+            f"📊 RSI (15m):  {rsi_str} _(Overbought)_\n"
+            f"📉 Trend (1h): {trend_str}\n"
+            f"📦 Volume:     {vol_str}\n"
+            f"💨 ATR:        {atr_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 Take Profit: ${take_profit:,.4f} _(-{tp_pct:.1f}%)_\n"
+            f"🛑 Stop Loss:   ${stop_loss:,.4f} _(+{sl_pct:.1f}%)_\n"
+            f"⚖️ Risk/Reward: 1:{rr}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
+            f"_PivotAlert — Dual TF Signal_ 📊"
+        )
+
+        await broadcast_signal(message, symbol, strength)
+        await log_signal(symbol, "SELL", price, support, resistance,
+                         rsi_val, strength, stop_loss, take_profit)
+        state["last_signal"]     = "SELL"
+        state["last_alert_time"] = now
+        logger.info(f"✅ SELL signal fired: {symbol.upper()} @ ${price:.2f} strength={strength}")
+        return
+
+    # Reset signal if price moved back inside range
+    if support < price < resistance:
+        state["last_signal"] = None
+
+# ─────────────────────────────────────────────
+# WebSocket — live price feed (aggTrade)
+# ─────────────────────────────────────────────
+async def price_stream(symbol: str) -> None:
+    """Tick-by-tick price updates via aggTrade stream."""
+    url, delay = f"wss://stream.binance.com:443/ws/{symbol}@aggTrade", 5
+    while symbol in coin_state:
+        try:
+            async with websockets.connect(url, ping_interval=20) as ws:
+                logger.info(f"[Price] Connected: {symbol}")
+                delay = 5
+                async for raw in ws:
+                    if symbol not in coin_state:
+                        return
+                    coin_state[symbol]["price"] = float(json.loads(raw)["p"])
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error(f"[Price] Error {symbol}: {e}")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)
+
+# ─────────────────────────────────────────────
+# WebSocket — 15m candle close stream (EVENT DRIVEN)
+# ─────────────────────────────────────────────
+async def candle_stream(symbol: str) -> None:
+    """
+    Subscribe to 15m kline stream.
+    Fires evaluate_signal ONLY when a candle CLOSES.
+    This eliminates polling lag — signals fire within ~1 second of candle close.
+    """
+    url   = f"wss://stream.binance.com:443/ws/{symbol}@kline_15m"
+    delay = 5
+
+    while symbol in coin_state:
+        try:
+            async with websockets.connect(url, ping_interval=20) as ws:
+                logger.info(f"[Candle] Connected: {symbol} (15m)")
+                delay = 5
+                async for raw in ws:
+                    if symbol not in coin_state:
+                        return
+
+                    msg    = json.loads(raw)
+                    kline  = msg["k"]
+                    closed = kline["x"]   # True when candle is CLOSED
+
+                    if closed:
+                        logger.info(f"[Candle] 15m closed: {symbol.upper()} @ {kline['c']}")
+                        # Fire signal evaluation immediately on candle close
+                        asyncio.create_task(evaluate_signal(symbol))
+
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error(f"[Candle] Error {symbol}: {e}")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)
+
+
+def start_coin_streams(symbol: str) -> None:
+    """Start both price + candle streams for a symbol."""
+    tasks = [
+        asyncio.create_task(price_stream(symbol)),
+        asyncio.create_task(candle_stream(symbol)),
+    ]
+    active_streams[symbol] = tasks
+
+# ─────────────────────────────────────────────
+# Telegram commands — user
 # ─────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id  = update.effective_chat.id
@@ -589,14 +838,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """, chat_id, username)
     await update.message.reply_text(
         "👋 Welcome to *PivotAlert!*\n\n"
-        "You are now subscribed to crypto trading signals.\n\n"
-        "📊 *Free plan includes:*\n"
+        "You're now subscribed to crypto trading signals.\n\n"
+        "📊 *Free plan:*\n"
         "• BTC, ETH, SOL signals\n"
-        "• Pivot point support & resistance\n"
-        "• RSI confirmation filter\n"
-        "• Alerts every 2 hours max\n\n"
-        "⭐ Use /upgrade to go Pro — ₹299/month\n"
-        "Use /help to see all commands",
+        "• Dual timeframe analysis (1h + 15m)\n"
+        "• Event-driven — fires on candle close\n"
+        "• SL/TP levels included\n"
+        "• 2hr cooldown per coin\n\n"
+        "⭐ Use /upgrade for Pro — ₹299/month\n"
+        "📋 Use /plan to compare plans\n"
+        "❓ Use /help to see all commands",
         parse_mode="Markdown"
     )
 
@@ -604,7 +855,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE users SET subscribed = FALSE WHERE chat_id = $1",
+            "UPDATE users SET subscribed=FALSE WHERE chat_id=$1",
             update.effective_chat.id
         )
     await update.message.reply_text("😢 Unsubscribed. Send /start to resubscribe!")
@@ -614,52 +865,20 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📋 *PivotAlert Plans:*\n\n"
         "🆓 *Free — ₹0/month*\n"
-        "• BTC, ETH, SOL signals only\n"
+        "• BTC, ETH, SOL only\n"
+        "• Signals strength ≥ 2★\n"
         "• 2 hour cooldown\n"
-        "• RSI filter (35/65)\n\n"
+        "• RSI threshold: 35/65\n\n"
         "⭐ *Pro — ₹299/month*\n"
         "• All tracked coins\n"
-        "• 1 hour cooldown\n"
-        "• Tighter RSI filter (38/62)\n\n"
+        "• All signal strengths\n"
+        "• 30 min cooldown\n"
+        "• RSI threshold: 38/62\n\n"
         "💎 *Elite — ₹799/month*\n"
         "• Everything in Pro\n"
         "• Forex + Stocks (coming soon)\n"
-        "• 30 min cooldown\n\n"
-        "Use /upgrade to subscribe to Pro!",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id  = update.effective_chat.id
-    username = update.effective_chat.username or "User"
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT plan FROM users WHERE chat_id = $1", chat_id)
-
-    if row and row["plan"] == "pro":
-        await update.message.reply_text(
-            "⭐ You are already on *Pro plan!*\nEnjoy your signals! 📈",
-            parse_mode="Markdown"
-        )
-        return
-
-    await update.message.reply_text("⏳ Generating your payment link...")
-    link = create_payment_link(chat_id, username)
-
-    if not link:
-        await update.message.reply_text("❌ Could not generate payment link. Try again later.")
-        return
-
-    await save_payment(chat_id, link["id"], TIER_SETTINGS["pro"]["price"])
-    await update.message.reply_text(
-        f"⭐ *Upgrade to PivotAlert Pro*\n\n"
-        f"₹299/month\n\n"
-        f"✅ All tracked coins\n"
-        f"✅ 1 hour cooldown\n"
-        f"✅ Priority signals\n\n"
-        f"👇 Pay securely:\n{link['short_url']}\n\n"
-        f"_Powered by Razorpay_ 🔒",
+        "• Custom coin requests\n\n"
+        "Use /upgrade to go Pro!",
         parse_mode="Markdown"
     )
 
@@ -668,7 +887,7 @@ async def cmd_myplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat_id = update.effective_chat.id
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT plan, joined_at FROM users WHERE chat_id = $1", chat_id
+            "SELECT plan, joined_at FROM users WHERE chat_id=$1", chat_id
         )
     if not row:
         await update.message.reply_text("Send /start to subscribe!")
@@ -678,9 +897,38 @@ async def cmd_myplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     joined = row["joined_at"].strftime("%d %b %Y")
     await update.message.reply_text(
         f"👤 *Your Account*\n\n"
-        f"Plan:   {emoji} {plan.upper()}\n"
-        f"Joined: {joined}\n\n"
-        f"{'Use /upgrade to go Pro! 🚀' if plan == 'free' else 'Enjoying Pro! 📈'}",
+        f"Plan:    {emoji} {plan.upper()}\n"
+        f"Joined:  {joined}\n\n"
+        f"{'Use /upgrade to go Pro! 🚀' if plan == 'free' else 'Enjoying Pro benefits! 📈'}",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id  = update.effective_chat.id
+    username = update.effective_chat.username or "User"
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT plan FROM users WHERE chat_id=$1", chat_id)
+    if row and row["plan"] == "pro":
+        await update.message.reply_text(
+            "⭐ You're already on *Pro!* Enjoy the signals! 📈",
+            parse_mode="Markdown"
+        )
+        return
+    await update.message.reply_text("⏳ Generating your payment link...")
+    link = create_payment_link(chat_id, username)
+    if not link:
+        await update.message.reply_text("❌ Could not generate link. Try again later.")
+        return
+    await save_payment(chat_id, link["id"], TIER_SETTINGS["pro"]["price"])
+    await update.message.reply_text(
+        f"⭐ *Upgrade to PivotAlert Pro*\n\n"
+        f"₹299/month — Cancel anytime\n\n"
+        f"✅ All tracked coins\n"
+        f"✅ 30 min cooldown\n"
+        f"✅ All signal strengths\n\n"
+        f"👇 Pay securely:\n{link['short_url']}\n\n"
+        f"_Powered by Razorpay_ 🔒",
         parse_mode="Markdown"
     )
 
@@ -693,7 +941,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["📋 *Tracked Coins:*\n"]
     for symbol in coins:
         price = coin_state.get(symbol, {}).get("price")
-        lines.append(f"• {symbol.upper()} — {'$' + f'{price:,.4f}' if price else 'loading...'}")
+        lines.append(f"• {symbol.upper()} — {'$'+f'{price:,.4f}' if price else 'loading...'}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -710,13 +958,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         support    = s.get("support")
         resistance = s.get("resistance")
         rsi        = s.get("rsi")
+        trend      = s.get("trend") or "n/a"
         signal     = s.get("last_signal") or "None"
+        vol        = s.get("volume_ratio")
         lines += [
             f"*{symbol.upper()}*",
-            f"  Price:      {'$' + f'{price:,.4f}' if price else 'loading...'}",
-            f"  Support:    {'$' + f'{support:,.4f}' if support else 'n/a'}",
-            f"  Resistance: {'$' + f'{resistance:,.4f}' if resistance else 'n/a'}",
-            f"  RSI:        {f'{rsi:.1f}' if rsi else 'n/a'}",
+            f"  Price:      {'$'+f'{price:,.4f}' if price else 'loading...'}",
+            f"  Support:    {'$'+f'{support:,.4f}' if support else 'n/a'}",
+            f"  Resistance: {'$'+f'{resistance:,.4f}' if resistance else 'n/a'}",
+            f"  RSI (15m):  {f'{rsi:.1f}' if rsi else 'n/a'}",
+            f"  Trend (1h): {trend}",
+            f"  Volume:     {f'{vol:.2f}x' if vol else 'n/a'}",
             f"  Signal:     {signal}\n",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -727,17 +979,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 *PivotAlert Commands:*\n\n"
         "/start    — Subscribe to signals\n"
         "/stop     — Unsubscribe\n"
-        "/plan     — See all plans\n"
-        "/myplan   — See your current plan\n"
-        "/upgrade  — Upgrade to Pro ⭐\n"
-        "/list     — Show tracked coins\n"
-        "/status   — Full indicator data\n"
-        "/help     — Show this message",
+        "/plan     — Compare plans\n"
+        "/myplan   — Your current plan\n"
+        "/upgrade  — Go Pro ⭐\n"
+        "/list     — Tracked coins & prices\n"
+        "/status   — Full indicator snapshot\n"
+        "/help     — This message",
         parse_mode="Markdown"
     )
 
 # ─────────────────────────────────────────────
-# Admin commands
+# Telegram commands — admin
 # ─────────────────────────────────────────────
 def is_admin(update: Update) -> bool:
     return str(update.effective_chat.id) == str(ADMIN_CHAT_ID)
@@ -749,7 +1001,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     async with db_pool.acquire() as conn:
         total    = await conn.fetchval("SELECT COUNT(*) FROM users")
-        subbed   = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscribed = TRUE")
+        subbed   = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscribed=TRUE")
         free_u   = await conn.fetchval("SELECT COUNT(*) FROM users WHERE plan='free' AND subscribed=TRUE")
         pro_u    = await conn.fetchval("SELECT COUNT(*) FROM users WHERE plan='pro' AND subscribed=TRUE")
         signals  = await conn.fetchval("SELECT COUNT(*) FROM signal_history")
@@ -804,12 +1056,19 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ {symbol.upper()} already tracked.")
         return
     await update.message.reply_text(f"🔍 Validating {symbol.upper()}...")
-    if not validate_symbol(symbol):
+    try:
+        resp = requests.get(
+            f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}",
+            timeout=5
+        )
+        if resp.status_code != 200:
+            raise ValueError("Not found")
+    except Exception:
         await update.message.reply_text(f"❌ {symbol.upper()} not found on Binance.")
         return
     await add_tracked_coin(symbol)
-    add_coin_state(symbol)
-    active_streams[symbol] = asyncio.create_task(price_stream(symbol))
+    init_coin_state(symbol)
+    start_coin_streams(symbol)
     await update.message.reply_text(f"✅ Now tracking {symbol.upper()}")
 
 
@@ -825,7 +1084,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"⚠️ {symbol.upper()} not tracked.")
         return
     await remove_tracked_coin(symbol)
-    remove_coin_state(symbol)
+    cleanup_coin(symbol)
     await update.message.reply_text(f"🗑️ Removed {symbol.upper()}")
 
 
@@ -842,7 +1101,7 @@ async def cmd_manualupgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Plan must be 'free' or 'pro'")
         return
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET plan = $1 WHERE chat_id = $2", plan, target_id)
+        await conn.execute("UPDATE users SET plan=$1 WHERE chat_id=$2", plan, target_id)
     await update.message.reply_text(f"✅ User {target_id} → {plan}")
     try:
         await bot.send_message(
@@ -854,191 +1113,23 @@ async def cmd_manualupgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         pass
 
 # ─────────────────────────────────────────────
-# WebSocket price stream
-# ─────────────────────────────────────────────
-async def price_stream(symbol: str) -> None:
-    url, reconnect_delay = f"wss://stream.binance.com:443/ws/{symbol}@aggTrade", 5
-    while symbol in coin_state:
-        try:
-            async with websockets.connect(url, ping_interval=20) as ws:
-                logger.info(f"WebSocket connected: {symbol}")
-                reconnect_delay = 5
-                async for raw in ws:
-                    if symbol not in coin_state:
-                        return
-                    coin_state[symbol]["price"] = float(json.loads(raw)["p"])
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            logger.error(f"WebSocket error for {symbol}: {e}")
-        await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, 60)
-
-# ─────────────────────────────────────────────
-# Signal evaluation
-# ─────────────────────────────────────────────
-async def evaluate_signal(symbol: str) -> None:
-    state = coin_state.get(symbol)
-    if not state or state["price"] is None:
-        return
- 
-    price = state["price"]
- 
-    # Fetch candles — need enough for all indicators
-    candles = fetch_klines(symbol, interval="1h", limit=100)
-    if len(candles) < 30:
-        return
- 
-    closes = [c["close"] for c in candles]
- 
-    # ── Calculate all indicators ──
-    rsi          = calculate_wilder_rsi(closes)
-    ema_fast     = calculate_ema(closes, 20)    # 20-period EMA (short term)
-    ema_slow     = calculate_ema(closes, 50)    # 50-period EMA (long term)
-    atr          = calculate_atr(candles)
-    volume_ratio = calculate_volume_ratio(candles)
-    support, resistance = calculate_pivot_levels(candles, lookback=5)
- 
-    if support is None or resistance is None:
-        return
- 
-    # Store in state for /status command
-    state["support"]    = support
-    state["resistance"] = resistance
-    state["rsi"]        = rsi
- 
-    rsi_str    = f"{rsi:.1f}"   if rsi    else "n/a"
-    atr_str    = f"{atr:.4f}"   if atr    else "n/a"
-    vol_str    = f"{volume_ratio:.2f}x" if volume_ratio else "n/a"
-    ema_f_str  = f"{ema_fast:.4f}"  if ema_fast  else "n/a"
-    ema_s_str  = f"{ema_slow:.4f}"  if ema_slow  else "n/a"
- 
-    logger.info(
-        f"{symbol.upper():10s} | price={price:.4f} | "
-        f"S={support:.4f} | R={resistance:.4f} | "
-        f"RSI={rsi_str} | EMA20={ema_f_str} | EMA50={ema_s_str} | "
-        f"ATR={atr_str} | VOL={vol_str}"
-    )
- 
-    now         = time.time()
-    last_signal = state["last_signal"]
-    on_cooldown = (now - state["last_alert_time"]) < TIER_SETTINGS["free"]["cooldown"]
- 
-    # ── EMA trend filter ──
-    uptrend   = ema_fast and ema_slow and ema_fast > ema_slow
-    downtrend = ema_fast and ema_slow and ema_fast < ema_slow
- 
-    # ── ATR volatility filter — skip signals in choppy markets ──
-    # If ATR is less than 0.1% of price, market is too quiet
-    min_atr = price * 0.001
-    if atr and atr < min_atr:
-        logger.info(f"{symbol.upper()} — ATR too low ({atr_str}), skipping signal")
-        return
- 
-    # ── BUY conditions ──
-    near_support   = price <= support * (1 + PIVOT_TOLERANCE)
-    rsi_oversold   = rsi is not None and rsi <= TIER_SETTINGS["free"]["rsi_oversold"]
-    trend_ok_buy   = uptrend or (ema_fast is None)   # allow if no EMA data yet
- 
-    if near_support and rsi_oversold and trend_ok_buy and \
-       last_signal != "BUY" and not on_cooldown:
- 
-        strength         = calculate_signal_strength(
-            rsi, volume_ratio, atr, price, ema_fast, ema_slow, "BUY"
-        )
-        stop_loss, take_profit = calculate_sl_tp(price, atr, "BUY")
-        sl_pct = abs((stop_loss   - price) / price * 100)
-        tp_pct = abs((take_profit - price) / price * 100)
-        rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
- 
-        message = (
-            f"📈 *{symbol.upper()} BUY SIGNAL*\n"
-            f"{'─' * 28}\n"
-            f"💰 Price:     ${price:,.4f}\n"
-            f"🟢 Support:   ${support:,.4f}\n"
-            f"📊 RSI:       {rsi_str} _(Oversold)_\n"
-            f"📈 EMA Trend: {'Bullish ✅' if uptrend else 'Neutral ⚠️'}\n"
-            f"📦 Volume:    {vol_str}\n"
-            f"💨 ATR:       {atr_str}\n"
-            f"{'─' * 28}\n"
-            f"🎯 Take Profit: ${take_profit:,.4f} _(+{tp_pct:.1f}%)_\n"
-            f"🛑 Stop Loss:   ${stop_loss:,.4f} _(-{sl_pct:.1f}%)_\n"
-            f"⚖️ Risk/Reward: 1:{rr}\n"
-            f"{'─' * 28}\n"
-            f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
-            f"_Powered by PivotAlert_ 📊"
-        )
- 
-        await broadcast_signal(message, symbol)
-        await log_signal(symbol, "BUY", price, support, resistance, rsi)
-        state["last_signal"]     = "BUY"
-        state["last_alert_time"] = now
-        return
- 
-    # ── SELL conditions ──
-    near_resistance = price >= resistance * (1 - PIVOT_TOLERANCE)
-    rsi_overbought  = rsi is not None and rsi >= TIER_SETTINGS["free"]["rsi_overbought"]
-    trend_ok_sell   = downtrend or (ema_fast is None)
- 
-    if near_resistance and rsi_overbought and trend_ok_sell and \
-       last_signal != "SELL" and not on_cooldown:
- 
-        strength         = calculate_signal_strength(
-            rsi, volume_ratio, atr, price, ema_fast, ema_slow, "SELL"
-        )
-        stop_loss, take_profit = calculate_sl_tp(price, atr, "SELL")
-        sl_pct = abs((stop_loss   - price) / price * 100)
-        tp_pct = abs((take_profit - price) / price * 100)
-        rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
- 
-        message = (
-            f"🚨 *{symbol.upper()} SELL SIGNAL*\n"
-            f"{'─' * 28}\n"
-            f"💰 Price:      ${price:,.4f}\n"
-            f"🔴 Resistance: ${resistance:,.4f}\n"
-            f"📊 RSI:        {rsi_str} _(Overbought)_\n"
-            f"📉 EMA Trend:  {'Bearish ✅' if downtrend else 'Neutral ⚠️'}\n"
-            f"📦 Volume:     {vol_str}\n"
-            f"💨 ATR:        {atr_str}\n"
-            f"{'─' * 28}\n"
-            f"🎯 Take Profit: ${take_profit:,.4f} _(-{tp_pct:.1f}%)_\n"
-            f"🛑 Stop Loss:   ${stop_loss:,.4f} _(+{sl_pct:.1f}%)_\n"
-            f"⚖️ Risk/Reward: 1:{rr}\n"
-            f"{'─' * 28}\n"
-            f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
-            f"_Powered by PivotAlert_ 📊"
-        )
- 
-        await broadcast_signal(message, symbol)
-        await log_signal(symbol, "SELL", price, support, resistance, rsi)
-        state["last_signal"]     = "SELL"
-        state["last_alert_time"] = now
-        return
- 
-    if support < price < resistance:
-        state["last_signal"] = None
- 
-
-async def signal_loop(interval_seconds: int = 60) -> None:
-    await asyncio.sleep(5)
-    while True:
-        coins = await get_tracked_coins()
-        await asyncio.gather(*[evaluate_signal(s) for s in coins])
-        await asyncio.sleep(interval_seconds)
-
-# ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
 async def main() -> None:
+    # Init database
     await init_db()
+
+    # Load tracked coins and start streams
     coins = await get_tracked_coins()
     for symbol in coins:
-        add_coin_state(symbol)
+        init_coin_state(symbol)
 
+    # Start webhook server
     await start_webhook_server()
 
+    # Start Telegram bot
     app = Application.builder().token(TOKEN).build()
-    for cmd, handler in [
+    for cmd, fn in [
         ("start",         cmd_start),
         ("stop",          cmd_stop),
         ("plan",          cmd_plan),
@@ -1053,23 +1144,29 @@ async def main() -> None:
         ("remove",        cmd_remove),
         ("manualupgrade", cmd_manualupgrade),
     ]:
-        app.add_handler(CommandHandler(cmd, handler))
+        app.add_handler(CommandHandler(cmd, fn))
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
     await send_alert(
-        "🚀 *PivotAlert Phase 2 is live!*\n"
-        "Razorpay payments enabled 💳\n"
-        "Send /stats to see subscribers."
+        "🚀 *PivotAlert — Event-Driven Mode*\n\n"
+        "✅ Dual timeframe: 1h trend + 15m entry\n"
+        "✅ Fires on candle close — no more lag\n"
+        "✅ Wilder RSI + Multi-pivot + EMA + ATR\n\n"
+        "Send /status to check indicators."
     )
 
+    # Start streams AFTER bot is ready
     for symbol in coins:
-        active_streams[symbol] = asyncio.create_task(price_stream(symbol))
+        start_coin_streams(symbol)
+        logger.info(f"Streams started: {symbol}")
 
-    await signal_loop()
+    # Keep running forever
+    await asyncio.Event().wait()
 
+    # Cleanup
     await app.updater.stop()
     await app.stop()
     await app.shutdown()
