@@ -672,7 +672,7 @@ async def evaluate_signal(symbol: str) -> None:
     # ── BUY signal ──
     near_support = price <= support * (1 + PIVOT_TOLERANCE)
     # Require confirmed uptrend OR neutral (not strong downtrend)
-    trend_ok_buy = not downtrend
+    trend_ok_buy = uptrend
 
     # Use free tier RSI as base threshold
     rsi_ok_buy = rsi_val is not None and rsi_val <= TIER_SETTINGS["free"]["rsi_oversold"]
@@ -714,7 +714,7 @@ async def evaluate_signal(symbol: str) -> None:
 
     # ── SELL signal ──
     near_resistance = price >= resistance * (1 - PIVOT_TOLERANCE)
-    trend_ok_sell   = not uptrend   # require confirmed downtrend OR neutral
+    trend_ok_sell   = downtrend   # require confirmed downtrend OR neutral
     rsi_ok_sell     = rsi_val is not None and rsi_val >= TIER_SETTINGS["free"]["rsi_overbought"]
 
     if near_resistance and rsi_ok_sell and trend_ok_sell and \
