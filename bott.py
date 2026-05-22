@@ -546,8 +546,8 @@ def sl_tp(
     price: float,
     atr_val: float | None,
     signal_type: str,
-    sl_mult: float = 1.5,
-    tp_mult: float = 2.5,
+    sl_mult: float = 2.5,
+    tp_mult: float = 3.5,
 ) -> tuple[float, float]:
     """ATR-based Stop Loss and Take Profit."""
     dist_sl = (atr_val * sl_mult) if atr_val else (price * 0.015)
