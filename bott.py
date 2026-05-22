@@ -61,7 +61,7 @@ TIER_SETTINGS = {
     "free": {
         "rsi_oversold":   35,
         "rsi_overbought": 65,
-        "cooldown":       7200,   # 2 hours
+        "cooldown":       14400,   # 4 hours
         "coins":          ["btcusdt", "ethusdt", "solusdt"],
         "price":          0,
         "min_strength":   2,      # minimum signal strength to receive
@@ -69,7 +69,7 @@ TIER_SETTINGS = {
     "pro": {
         "rsi_oversold":   38,
         "rsi_overbought": 62,
-        "cooldown":       1800,   # 30 minutes
+        "cooldown":       7200,   # 2 hours
         "coins":          None,   # all coins
         "price":          29900,
         "min_strength":   1,      # receive all signals
