@@ -594,12 +594,11 @@ async def evaluate_signal(symbol: str) -> None:
     Uses 1h candles for trend (EMA, pivot) and 15m for entry (RSI).
     """
     state = coin_state.get(symbol)
-    if not state:
+    if not state or state["price"] is None:
         return
 
     price = state["price"]
-    if price is None:
-        return
+    now = time.time()
 
     # ── Fetch both timeframes concurrently ──
     candles_1h, candles_15m = await asyncio.gather(
@@ -607,155 +606,101 @@ async def evaluate_signal(symbol: str) -> None:
         fetch_klines_async(symbol, "15m", limit=100),
     )
 
-    if len(candles_1h) < 30 or len(candles_15m) < 30:
+    if len(candles_1h) < 35 or len(candles_15m) < 30:
         return
 
-    closes_1h  = [c["close"] for c in candles_1h]
+    closes_1h = [c["close"] for c in candles_1h]
     closes_15m = [c["close"] for c in candles_15m]
 
-    # ── Trend indicators from 1h ──
-    ema_fast     = ema(closes_1h, 20)
-    ema_slow     = ema(closes_1h, 50)
-    atr_val      = atr(candles_1h)
-    support, resistance = pivot_levels(candles_1h, lookback=5)
+    # ── Calculate Indicators ──
+    rsi = wilder_rsi(closes_15m)
+    ema_fast = ema(closes_1h, 20)
+    ema_slow = ema(closes_1h, 50)
+    atr_val = atr(candles_1h)
+    vol_ratio = volume_ratio(candles_15m)
+    support, resistance = pivot_levels(candles_1h, lookback=3)   # Reduced for faster response
 
-    # ── Entry indicators from 15m ──
-    rsi_val  = wilder_rsi(closes_15m)
-    vol_rat  = volume_ratio(candles_15m)
-
-    if support is None or resistance is None:
+    if None in (rsi, support, resistance):
         return
 
-    # ── Trend direction ──
-    uptrend   = ema_fast and ema_slow and ema_fast > ema_slow
-    downtrend = ema_fast and ema_slow and ema_fast < ema_slow
-    trend_str = "Bullish 📈" if uptrend else ("Bearish 📉" if downtrend else "Neutral ⚠️")
-
-    # ── Update state for /status command ──
+    # Update state
     state.update({
-        "support":      support,
-        "resistance":   resistance,
-        "rsi":          rsi_val,
-        "ema_fast":     ema_fast,
-        "ema_slow":     ema_slow,
-        "atr":          atr_val,
-        "volume_ratio": vol_rat,
-        "trend":        trend_str,
+        "support": support,
+        "resistance": resistance,
+        "rsi": rsi,
+        "ema_fast": ema_fast,
+        "ema_slow": ema_slow,
+        "atr": atr_val,
+        "volume_ratio": vol_ratio,
     })
 
-    rsi_str = f"{rsi_val:.1f}" if rsi_val else "n/a"
-    vol_str = f"{vol_rat:.2f}x" if vol_rat else "n/a"
-    atr_str = f"{atr_val:.4f}" if atr_val else "n/a"
-
-    logger.info(
-        f"{symbol.upper():10s} | ${price:.2f} | "
-        f"S=${support:.2f} R=${resistance:.2f} | "
-        f"RSI(15m)={rsi_str} | EMA20={ema_fast:.2f} EMA50={ema_slow:.2f} | "
-        f"ATR={atr_str} | VOL={vol_str} | Trend={trend_str}"
-        if ema_fast and ema_slow else
-        f"{symbol.upper():10s} | ${price:.2f} | "
-        f"S=${support:.2f} R=${resistance:.2f} | RSI={rsi_str}"
-    )
-
-    # ── ATR volatility filter — skip dead markets ──
-    if atr_val and atr_val < price * 0.001:
-        logger.info(f"{symbol.upper()} — market too quiet (ATR={atr_str}), skipping")
+    # ── Pre-filters ──
+    if atr_val and atr_val < price * 0.001:          # Too choppy
+        return
+    if vol_ratio and vol_ratio < 1.1:                # Require decent volume
         return
 
-    # ── Per-coin cooldown uses WORST tier (free) so no signal is missed ──
-    # Individual subscribers are filtered by their own tier cooldown in broadcast
-    now         = time.time()
-    last_signal = state["last_signal"]
-    # Use pro cooldown as global gate (shorter = more signals available)
-    on_cooldown = (now - state["last_alert_time"]) < TIER_SETTINGS["pro"]["cooldown"]
+    # Strict Trend
+    uptrend = ema_fast and ema_slow and ema_fast > ema_slow
+    downtrend = ema_fast and ema_slow and ema_fast < ema_slow
 
-    # ── BUY signal ──
     near_support = price <= support * (1 + PIVOT_TOLERANCE)
-    # Require confirmed uptrend OR neutral (not strong downtrend)
-    trend_ok_buy = uptrend
-
-    # Use free tier RSI as base threshold
-    rsi_ok_buy = rsi_val is not None and rsi_val <= TIER_SETTINGS["free"]["rsi_oversold"]
-
-    if near_support and rsi_ok_buy and trend_ok_buy and \
-       last_signal != "BUY" and not on_cooldown:
-
-        strength = signal_strength(rsi_val, vol_rat, ema_fast, ema_slow, "BUY")
-        stop_loss, take_profit = sl_tp(price, atr_val, "BUY")
-        sl_pct = abs((stop_loss   - price) / price * 100)
-        tp_pct = abs((take_profit - price) / price * 100)
-        rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
-
-        message = (
-            f"📈 *{symbol.upper()} BUY SIGNAL*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Price:      ${price:,.4f}\n"
-            f"🟢 Support:    ${support:,.4f}\n"
-            f"📊 RSI (15m):  {rsi_str} _(Oversold)_\n"
-            f"📈 Trend (1h): {trend_str}\n"
-            f"📦 Volume:     {vol_str}\n"
-            f"💨 ATR:        {atr_str}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 Take Profit: ${take_profit:,.4f} _(+{tp_pct:.1f}%)_\n"
-            f"🛑 Stop Loss:   ${stop_loss:,.4f} _(-{sl_pct:.1f}%)_\n"
-            f"⚖️ Risk/Reward: 1:{rr}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
-            f"_PivotAlert — Dual TF Signal_ 📊"
-        )
-
-        await broadcast_signal(message, symbol, strength)
-        await log_signal(symbol, "BUY", price, support, resistance,
-                         rsi_val, strength, stop_loss, take_profit)
-        state["last_signal"]     = "BUY"
-        state["last_alert_time"] = now
-        logger.info(f"✅ BUY signal fired: {symbol.upper()} @ ${price:.2f} strength={strength}")
-        return
-
-    # ── SELL signal ──
     near_resistance = price >= resistance * (1 - PIVOT_TOLERANCE)
-    trend_ok_sell   = downtrend   # require confirmed downtrend OR neutral
-    rsi_ok_sell     = rsi_val is not None and rsi_val >= TIER_SETTINGS["free"]["rsi_overbought"]
 
-    if near_resistance and rsi_ok_sell and trend_ok_sell and \
-       last_signal != "SELL" and not on_cooldown:
+    signal_type = None
+    strength = 0
 
-        strength = signal_strength(rsi_val, vol_rat, ema_fast, ema_slow, "SELL")
-        stop_loss, take_profit = sl_tp(price, atr_val, "SELL")
-        sl_pct = abs((stop_loss   - price) / price * 100)
-        tp_pct = abs((take_profit - price) / price * 100)
-        rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
+    # BUY
+    if near_support and rsi <= TIER_SETTINGS["free"]["rsi_oversold"] and uptrend:
+        strength = signal_strength(rsi, vol_ratio, ema_fast, ema_slow, "BUY")
+        if strength >= 3:
+            signal_type = "BUY"
 
-        message = (
-            f"🚨 *{symbol.upper()} SELL SIGNAL*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Price:      ${price:,.4f}\n"
-            f"🔴 Resistance: ${resistance:,.4f}\n"
-            f"📊 RSI (15m):  {rsi_str} _(Overbought)_\n"
-            f"📉 Trend (1h): {trend_str}\n"
-            f"📦 Volume:     {vol_str}\n"
-            f"💨 ATR:        {atr_str}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 Take Profit: ${take_profit:,.4f} _(-{tp_pct:.1f}%)_\n"
-            f"🛑 Stop Loss:   ${stop_loss:,.4f} _(+{sl_pct:.1f}%)_\n"
-            f"⚖️ Risk/Reward: 1:{rr}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
-            f"_PivotAlert — Dual TF Signal_ 📊"
-        )
+    # SELL
+    elif near_resistance and rsi >= TIER_SETTINGS["free"]["rsi_overbought"] and downtrend:
+        strength = signal_strength(rsi, vol_ratio, ema_fast, ema_slow, "SELL")
+        if strength >= 3:
+            signal_type = "SELL"
 
-        await broadcast_signal(message, symbol, strength)
-        await log_signal(symbol, "SELL", price, support, resistance,
-                         rsi_val, strength, stop_loss, take_profit)
-        state["last_signal"]     = "SELL"
-        state["last_alert_time"] = now
-        logger.info(f"✅ SELL signal fired: {symbol.upper()} @ ${price:.2f} strength={strength}")
+    if not signal_type:
+        if support < price < resistance:
+            state["last_signal"] = None
         return
 
-    # Reset signal if price moved back inside range
-    if support < price < resistance:
-        state["last_signal"] = None
+    # ── Cooldown Check (Global) ──
+    if (now - state.get("last_alert_time", 0)) < TIER_SETTINGS["pro"]["cooldown"]:
+        return
 
+    # ── Generate Signal ──
+    stop_loss, take_profit = sl_tp(price, atr_val, signal_type, sl_mult=2.5, tp_mult=3.5)
+
+    sl_pct = abs((stop_loss - price) / price * 100)
+    tp_pct = abs((take_profit - price) / price * 100)
+    rr = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0.0
+
+    emoji = "📈" if signal_type == "BUY" else "🚨"
+    message = f"""{emoji} *{symbol.upper()} {signal_type} SIGNAL*
+{'─' * 32}
+💰 Price: ${price:,.4f}
+{"🟢 Support" if signal_type == "BUY" else "🔴 Resistance"}: ${support if signal_type == "BUY" else resistance:,.4f}
+📊 RSI: {rsi:.1f} ({"Oversold" if signal_type == "BUY" else "Overbought"})
+📈 Trend: {"Bullish ✅" if signal_type == "BUY" else "Bearish ✅"}
+📦 Volume: {vol_ratio:.2f}x
+💨 ATR: {atr_val:.4f if atr_val else "N/A"}
+{'─' * 32}
+🎯 TP: ${take_profit:,.4f} ({'+' if signal_type == "BUY" else '-'}{tp_pct:.1f}%)
+🛑 SL: ${stop_loss:,.4f} ({'-' if signal_type == "BUY" else '+'}{sl_pct:.1f}%)
+⚖️ R:R: 1:{rr}
+{'─' * 32}
+💪 Strength: {stars(strength)} ({strength}/5)
+
+_Powered by PivotAlert 📊_"""
+
+    await broadcast_signal(message, symbol, strength=strength)
+    await log_signal(symbol, signal_type, price, support, resistance, rsi, strength, stop_loss, take_profit)
+
+    state["last_signal"] = signal_type
+    state["last_alert_time"] = now
 # ─────────────────────────────────────────────
 # WebSocket — live price feed (aggTrade)
 # ─────────────────────────────────────────────
