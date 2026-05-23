@@ -533,36 +533,35 @@ def signal_strength(
     ema_fast: float | None,
     ema_slow: float | None,
     signal_type: str,
-    tier: str = "free",
+    tier: str = "free",        # use calling tier for scoring
 ) -> int:
     """
-    Score 0-5 based on confluence.
-    Uses tier-specific RSI thresholds.
+    Score 0–5 based on indicator confluence.
+    Tier-aware: pro tier uses tighter RSI so scores higher sooner.
     """
     score    = 0
     settings = TIER_SETTINGS[tier]
-
-    # RSI strength
+ 
+    # RSI strength — how far past the threshold
     if rsi_val is not None:
         if signal_type == "BUY":
-            if rsi_val <= settings["rsi_oversold"] - 10: score += 2
-            elif rsi_val <= settings["rsi_oversold"]:    score += 1
+            if rsi_val <= settings["rsi_oversold"] - 10:  score += 2
+            elif rsi_val <= settings["rsi_oversold"]:      score += 1
         else:
             if rsi_val >= settings["rsi_overbought"] + 10: score += 2
             elif rsi_val >= settings["rsi_overbought"]:    score += 1
-
-    # Volume confirmation
+ 
+    # Volume confirmation — require meaningful volume
     if vol_ratio is not None:
-        if vol_ratio >= 2.0:   score += 2
-        elif vol_ratio >= 1.5: score += 1
-
+        if vol_ratio >= 2.0:    score += 2
+        elif vol_ratio >= 1.5:  score += 1
+ 
     # EMA trend alignment
     if ema_fast and ema_slow:
         if signal_type == "BUY"  and ema_fast > ema_slow: score += 1
         if signal_type == "SELL" and ema_fast < ema_slow: score += 1
-
+ 
     return min(score, 5)
-
 
 def sl_tp(
     price: float,
