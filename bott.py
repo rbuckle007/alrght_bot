@@ -231,41 +231,63 @@ async def send_alert(message: str) -> None:
         logger.error(f"Failed to send alert: {e}")
 
 
-async def broadcast_signal(message: str, symbol: str, strength: int) -> None:
+# ── 1. Fixed broadcast_signal ──
+# Now properly filters by tier cooldown AND tier RSI thresholds
+# so each user gets signals appropriate to their plan
+ 
+async def broadcast_signal(
+    message: str,
+    symbol: str,
+    strength: int,
+    signal_type: str,
+    rsi_val: float,
+) -> None:
     """
-    Broadcast signal to subscribers.
-    Free users: only their 3 coins + min strength 2
-    Pro users:  all coins + all strengths
+    Broadcast signal to subscribers with per-tier filtering:
+    - Coin access (free = 3 coins, pro = all)
+    - Signal strength filter (free >= 2, pro >= 1)
+    - Per-user cooldown based on their own tier
+    - RSI threshold check per tier
     """
     subscribers = await get_all_subscribers()
     sent = 0
+ 
     for user in subscribers:
         tier     = user["plan"]
+        chat_id  = user["chat_id"]
         settings = TIER_SETTINGS[tier]
-        allowed  = settings["coins"]
-        min_str  = settings["min_strength"]
-
-        # Tier coin filter
+ 
+        # Coin access filter
+        allowed = settings["coins"]
         if allowed and symbol not in allowed:
             continue
-
-        # Tier strength filter — free users skip weak signals
-        if strength < min_str:
+ 
+        # Strength filter per tier
+        if strength < settings["min_strength"]:
             continue
-
+ 
+        # RSI threshold per tier
+        if signal_type == "BUY"  and rsi_val > settings["rsi_oversold"]:
+            continue
+        if signal_type == "SELL" and rsi_val < settings["rsi_overbought"]:
+            continue
+ 
+        # Per-user cooldown — check last alert time per user per coin
+        user_key       = f"last_alert_{chat_id}_{symbol}"
+        last_user_alert= state_cache.get(user_key, 0)
+        if (time.time() - last_user_alert) < settings["cooldown"]:
+            continue
+ 
         try:
-            await bot.send_message(
-                chat_id=user["chat_id"],
-                text=message,
-                parse_mode="Markdown"
-            )
+            await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+            state_cache[user_key] = time.time()
             sent += 1
             await asyncio.sleep(0.05)
         except Exception as e:
-            logger.warning(f"Could not send to {user['chat_id']}: {e}")
-
-    logger.info(f"Signal sent to {sent}/{len(subscribers)} users")
-
+            logger.warning(f"Could not send to {chat_id}: {e}")
+ 
+    logger.info(f"[{symbol.upper()}] {signal_type} broadcast to {sent}/{len(subscribers)} users")
+ 
 # ─────────────────────────────────────────────
 # Razorpay helpers
 # ─────────────────────────────────────────────
