@@ -94,7 +94,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # coin_state stores per-symbol runtime data
 coin_state: dict[str, dict] = {}
-
+state_cache: dict = {}   # per-user cooldown tracking
 # active_streams tracks running WebSocket tasks
 active_streams: dict[str, list[asyncio.Task]] = {}
 
