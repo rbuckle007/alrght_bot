@@ -606,122 +606,209 @@ def cleanup_coin(symbol: str) -> None:
     for task in active_streams.pop(symbol, []):
         task.cancel()
 
-# ─────────────────────────────────────────────
-# Signal evaluation — called on every 15m candle close
-# ─────────────────────────────────────────────
+# ── 3. Fixed evaluate_signal ──
+# Fixes: cooldown, tier RSI, DRY signal block,
+#        freshness check, volume filter, plan-aware broadcast
+ 
+# In-memory cache for per-user cooldown tracking
+# Add this near your other globals:
+#   state_cache: dict = {}
+# (add this line once near the top of your bott.py globals section)
+ 
 async def evaluate_signal(symbol: str) -> None:
     """
     Full signal evaluation triggered by 15m candle close.
-    Uses 1h candles for trend (EMA, pivot) and 15m for entry (RSI).
+    - 1h candles → trend (EMA 20/50, pivot)
+    - 15m candles → entry (Wilder RSI, volume)
+    - Per-tier cooldown enforced in broadcast_signal
+    - Strict trend filter (uptrend for BUY, downtrend for SELL)
+    - Freshness check on candle data
+    - Volume pre-filter (>= 1.2x average)
+    - Minimum strength >= 3 to fire
     """
     state = coin_state.get(symbol)
     if not state or state["price"] is None:
         return
-
+ 
     price = state["price"]
-    now = time.time()
-
-    # ── Fetch both timeframes concurrently ──
+    now   = time.time()
+ 
+    # ── Fetch both timeframes concurrently (non-blocking) ──
     candles_1h, candles_15m = await asyncio.gather(
         fetch_klines_async(symbol, "1h",  limit=100),
         fetch_klines_async(symbol, "15m", limit=100),
     )
-
-    if len(candles_1h) < 35 or len(candles_15m) < 30:
+ 
+    if len(candles_1h) < 55 or len(candles_15m) < 30:
         return
-
-    closes_1h = [c["close"] for c in candles_1h]
+ 
+    # ── Freshness check ──
+    # Binance kline open_time is ms; last candle should be recent
+    # We re-fetch with open_time to validate — use close time approximation:
+    # Last 15m candle close should be within last 20 minutes
+    # candles_15m[-1]["close"] is price — use time from ws event instead
+    # Simple check: if live price differs >2% from last candle close, data is stale
+    last_close_15m = candles_15m[-1]["close"]
+    if abs(price - last_close_15m) / last_close_15m > 0.02:
+        logger.warning(f"{symbol.upper()} — stale candle data (price={price:.2f} vs close={last_close_15m:.2f}), skipping")
+        return
+ 
+    closes_1h  = [c["close"] for c in candles_1h]
     closes_15m = [c["close"] for c in candles_15m]
-
-    # ── Calculate Indicators ──
-    rsi = wilder_rsi(closes_15m)
-    ema_fast = ema(closes_1h, 20)
-    ema_slow = ema(closes_1h, 50)
-    atr_val = atr(candles_1h)
-    vol_ratio = volume_ratio(candles_15m)
-    support, resistance = pivot_levels(candles_1h, lookback=3)   # Reduced for faster response
-
-    if None in (rsi, support, resistance):
+ 
+    # ── Indicators ──
+    rsi_val  = wilder_rsi(closes_15m)          # entry: 15m RSI
+    ema_fast = ema(closes_1h, 20)              # trend: 1h EMA20
+    ema_slow = ema(closes_1h, 50)              # trend: 1h EMA50
+    atr_val  = atr(candles_1h)                 # volatility: 1h ATR
+    vol_rat  = volume_ratio(candles_15m)       # volume: 15m ratio
+    support, resistance = pivot_levels(candles_1h, lookback=5)
+ 
+    if None in (rsi_val, support, resistance):
         return
-
-    # Update state
+ 
+    # ── Update shared state for /status command ──
+    uptrend   = bool(ema_fast and ema_slow and ema_fast > ema_slow)
+    downtrend = bool(ema_fast and ema_slow and ema_fast < ema_slow)
+    trend_str = "Bullish 📈" if uptrend else ("Bearish 📉" if downtrend else "Neutral ⚠️")
+ 
     state.update({
-        "support": support,
-        "resistance": resistance,
-        "rsi": rsi,
-        "ema_fast": ema_fast,
-        "ema_slow": ema_slow,
-        "atr": atr_val,
-        "volume_ratio": vol_ratio,
+        "support":      support,
+        "resistance":   resistance,
+        "rsi":          rsi_val,
+        "ema_fast":     ema_fast,
+        "ema_slow":     ema_slow,
+        "atr":          atr_val,
+        "volume_ratio": vol_rat,
+        "trend":        trend_str,
     })
-
+ 
+    rsi_str = f"{rsi_val:.1f}"
+    vol_str = f"{vol_rat:.2f}x"   if vol_rat  else "n/a"
+    atr_str = f"{atr_val:.4f}"    if atr_val  else "n/a"
+ 
+    logger.info(
+        f"{symbol.upper():10s} | ${price:.2f} | "
+        f"S=${support:.2f} R=${resistance:.2f} | "
+        f"RSI={rsi_str} | Trend={trend_str} | VOL={vol_str} | ATR={atr_str}"
+    )
+ 
     # ── Pre-filters ──
-    if atr_val and atr_val < price * 0.001:          # Too choppy
+ 
+    # 1. Volatility filter — skip dead/choppy markets
+    if atr_val and atr_val < price * 0.001:
+        logger.info(f"{symbol.upper()} — ATR too low ({atr_str}), skipping")
         return
-    if vol_ratio and vol_ratio < 1.1:                # Require decent volume
+ 
+    # 2. Volume filter — require meaningful participation
+    if vol_rat is not None and vol_rat < 1.2:
+        logger.info(f"{symbol.upper()} — Volume too low ({vol_str}), skipping")
         return
-
-    # Strict Trend
-    uptrend = ema_fast and ema_slow and ema_fast > ema_slow
-    downtrend = ema_fast and ema_slow and ema_fast < ema_slow
-
-    near_support = price <= support * (1 + PIVOT_TOLERANCE)
+ 
+    # ── Proximity checks ──
+    near_support    = price <= support    * (1 + PIVOT_TOLERANCE)
     near_resistance = price >= resistance * (1 - PIVOT_TOLERANCE)
-
+ 
+    # ── Determine signal type ──
+    # Strict trend requirement: BUY only in uptrend, SELL only in downtrend
     signal_type = None
-    strength = 0
-
-    # BUY
-    if near_support and rsi <= TIER_SETTINGS["free"]["rsi_oversold"] and uptrend:
-        strength = signal_strength(rsi, vol_ratio, ema_fast, ema_slow, "BUY")
-        if strength >= 3:
-            signal_type = "BUY"
-
-    # SELL
-    elif near_resistance and rsi >= TIER_SETTINGS["free"]["rsi_overbought"] and downtrend:
-        strength = signal_strength(rsi, vol_ratio, ema_fast, ema_slow, "SELL")
-        if strength >= 3:
-            signal_type = "SELL"
-
+ 
+    if (near_support
+            and rsi_val <= TIER_SETTINGS["free"]["rsi_oversold"]
+            and uptrend):
+        signal_type = "BUY"
+ 
+    elif (near_resistance
+            and rsi_val >= TIER_SETTINGS["free"]["rsi_overbought"]
+            and downtrend):
+        signal_type = "SELL"
+ 
+    # Reset last_signal if price returned to mid-range
     if not signal_type:
         if support < price < resistance:
             state["last_signal"] = None
         return
-
-    # ── Cooldown Check (Global) ──
+ 
+    # ── Duplicate signal guard ──
+    if state["last_signal"] == signal_type:
+        return
+ 
+    # ── Global cooldown — use PRO (shortest) as gate ──
+    # Per-user/tier cooldown is handled inside broadcast_signal
     if (now - state.get("last_alert_time", 0)) < TIER_SETTINGS["pro"]["cooldown"]:
         return
-
-    # ── Generate Signal ──
+ 
+    # ── Compute strength using base (free) tier ──
+    # broadcast_signal re-evaluates per user tier
+    strength = signal_strength(
+        rsi_val, vol_rat, ema_fast, ema_slow, signal_type, tier="free"
+    )
+ 
+    # Minimum quality gate — don't send weak signals
+    if strength < 3:
+        logger.info(
+            f"{symbol.upper()} — {signal_type} signal too weak "
+            f"(strength={strength}/5), skipping"
+        )
+        return
+ 
+    # ── SL / TP ──
     stop_loss, take_profit = sl_tp(price, atr_val, signal_type, sl_mult=2.5, tp_mult=3.5)
-
-    sl_pct = abs((stop_loss - price) / price * 100)
+    sl_pct = abs((stop_loss   - price) / price * 100)
     tp_pct = abs((take_profit - price) / price * 100)
-    rr = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0.0
-
-    emoji = "📈" if signal_type == "BUY" else "🚨"
-    message = f"""{emoji} *{symbol.upper()} {signal_type} SIGNAL*
-{'─' * 32}
-💰 Price: ${price:,.4f}
-{"🟢 Support" if signal_type == "BUY" else "🔴 Resistance"}: ${support if signal_type == "BUY" else resistance:,.4f}
-📊 RSI: {rsi:.1f} ({"Oversold" if signal_type == "BUY" else "Overbought"})
-📈 Trend: {"Bullish ✅" if signal_type == "BUY" else "Bearish ✅"}
-📦 Volume: {vol_ratio:.2f}x
-💨 ATR: {atr_val:.4f if atr_val else "N/A"}
-{'─' * 32}
-🎯 TP: ${take_profit:,.4f} ({'+' if signal_type == "BUY" else '-'}{tp_pct:.1f}%)
-🛑 SL: ${stop_loss:,.4f} ({'-' if signal_type == "BUY" else '+'}{sl_pct:.1f}%)
-⚖️ R:R: 1:{rr}
-{'─' * 32}
-💪 Strength: {stars(strength)} ({strength}/5)
-
-_Powered by PivotAlert 📊_"""
-
-    await broadcast_signal(message, symbol, strength=strength)
-    await log_signal(symbol, signal_type, price, support, resistance, rsi, strength, stop_loss, take_profit)
-
-    state["last_signal"] = signal_type
+    rr     = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0.0
+ 
+    # ── Build message (DRY — single block for both BUY and SELL) ──
+    emoji     = "📈" if signal_type == "BUY" else "🚨"
+    level_lbl = "🟢 Support"    if signal_type == "BUY" else "🔴 Resistance"
+    level_val = support          if signal_type == "BUY" else resistance
+    tp_sign   = "+"              if signal_type == "BUY" else "-"
+    sl_sign   = "-"              if signal_type == "BUY" else "+"
+    rsi_lbl   = "Oversold"      if signal_type == "BUY" else "Overbought"
+    trend_lbl = "Bullish ✅"    if signal_type == "BUY" else "Bearish ✅"
+ 
+    message = (
+        f"{emoji} *{symbol.upper()} {signal_type} SIGNAL*\n"
+        f"{'━' * 26}\n"
+        f"💰 Price:       ${price:,.4f}\n"
+        f"{level_lbl}: ${level_val:,.4f}\n"
+        f"📊 RSI (15m):   {rsi_str} _({rsi_lbl})_\n"
+        f"📈 Trend (1h):  {trend_lbl}\n"
+        f"📦 Volume:      {vol_str}\n"
+        f"💨 ATR:         {atr_str}\n"
+        f"{'━' * 26}\n"
+        f"🎯 TP: ${take_profit:,.4f} _({tp_sign}{tp_pct:.1f}%)_\n"
+        f"🛑 SL: ${stop_loss:,.4f}  _({sl_sign}{sl_pct:.1f}%)_\n"
+        f"⚖️ R:R: 1:{rr}\n"
+        f"{'━' * 26}\n"
+        f"💪 Strength: {stars(strength)} ({strength}/5)\n\n"
+        f"_PivotAlert — Dual TF Signal_ 📊"
+    )
+ 
+    # ── Broadcast with per-tier filtering ──
+    await broadcast_signal(
+        message   = message,
+        symbol    = symbol,
+        strength  = strength,
+        signal_type = signal_type,
+        rsi_val   = rsi_val,
+    )
+ 
+    # ── Persist signal ──
+    await log_signal(
+        symbol, signal_type, price,
+        support, resistance, rsi_val,
+        strength, stop_loss, take_profit,
+    )
+ 
+    # ── Update state ──
+    state["last_signal"]     = signal_type
     state["last_alert_time"] = now
+ 
+    logger.info(
+        f"✅ {signal_type} fired: {symbol.upper()} @ ${price:.2f} | "
+        f"strength={strength}/5 | SL=${stop_loss:.2f} TP=${take_profit:.2f}"
+    )
 # ─────────────────────────────────────────────
 # WebSocket — live price feed (aggTrade)
 # ─────────────────────────────────────────────
